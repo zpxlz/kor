@@ -19,6 +19,7 @@ import (
 var exceptionSecretTypes = []string{
 	`helm.sh/release.v1`,
 	`kubernetes.io/dockerconfigjson`,
+	`kubernetes.io/dockercfg`,
 	`kubernetes.io/service-account-token`,
 }
 
@@ -113,6 +114,11 @@ func retrieveSecretNames(clientset kubernetes.Interface, namespace string, filte
 		return nil, nil, err
 	}
 
+	config, err := unmarshalConfig(secretsConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var unusedSecretNames []string
 	names := make([]string, 0, len(secrets.Items))
 	for _, secret := range secrets.Items {
@@ -125,19 +131,23 @@ func retrieveSecretNames(clientset kubernetes.Interface, namespace string, filte
 			continue
 		}
 
-		config, err := unmarshalConfig(secretsConfig)
+		exceptionFound, err := isResourceException(secret.Name, secret.Namespace, config.ExceptionSecrets)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if !slices.Contains(exceptionSecretTypes, string(secret.Type)) && !isResourceException(secret.Name, namespace, config.ExceptionSecrets) {
+		if exceptionFound {
+			continue
+		}
+
+		if !slices.Contains(exceptionSecretTypes, string(secret.Type)) && !exceptionFound {
 			names = append(names, secret.Name)
 		}
 	}
 	return names, unusedSecretNames, nil
 }
 
-func processNamespaceSecret(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]string, error) {
+func processNamespaceSecret(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]ResourceInfo, error) {
 	envSecrets, envSecrets2, volumeSecrets, initContainerEnvSecrets, pullSecrets, tlsSecrets, err := retrieveUsedSecret(clientset, namespace)
 	if err != nil {
 		return nil, err
@@ -168,31 +178,42 @@ func processNamespaceSecret(clientset kubernetes.Interface, namespace string, fi
 	for _, slice := range slicesToAppend {
 		usedSecrets = append(usedSecrets, slice...)
 	}
-	diff := CalculateResourceDifference(usedSecrets, secretNames)
-	diff = append(diff, unusedSecretNames...)
+
+	var diff []ResourceInfo
+
+	for _, name := range CalculateResourceDifference(usedSecrets, secretNames) {
+		reason := "Secret is not used in any pod, container, or ingress"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+
+	for _, name := range unusedSecretNames {
+		reason := "Marked with unused label"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+
 	return diff, nil
 
 }
 
 func GetUnusedSecrets(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+	resources := make(map[string]map[string][]ResourceInfo)
 	for _, namespace := range filterOpts.Namespaces(clientset) {
 		diff, err := processNamespaceSecret(clientset, namespace, filterOpts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to process namespace %s: %v\n", namespace, err)
 			continue
 		}
-		switch opts.GroupBy {
-		case "namespace":
-			resources[namespace] = make(map[string][]string)
-			resources[namespace]["Secret"] = diff
-		case "resource":
-			appendResources(resources, "Secret", namespace, diff)
-		}
 		if opts.DeleteFlag {
 			if diff, err = DeleteResource(diff, clientset, namespace, "Secret", opts.NoInteractive); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to delete Secret %s in namespace %s: %v\n", diff, namespace, err)
 			}
+		}
+		switch opts.GroupBy {
+		case "namespace":
+			resources[namespace] = make(map[string][]ResourceInfo)
+			resources[namespace]["Secret"] = diff
+		case "resource":
+			appendResources(resources, "Secret", namespace, diff)
 		}
 	}
 

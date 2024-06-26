@@ -74,17 +74,6 @@ func retrieveUsedCM(clientset kubernetes.Interface, namespace string) ([]string,
 		}
 	}
 
-	config, err := unmarshalConfig(configMapsConfig)
-	if err != nil {
-		return nil, nil, nil, nil, nil, err
-	}
-
-	for _, resource := range config.ExceptionConfigMaps {
-		if resource.Namespace == namespace || resource.Namespace == "*" {
-			volumesCM = append(volumesCM, resource.ResourceName)
-		}
-	}
-
 	return volumesCM, envCM, envFromCM, envFromContainerCM, envFromInitContainerCM, nil
 }
 
@@ -112,8 +101,12 @@ func retrieveConfigMapNames(clientset kubernetes.Interface, namespace string, fi
 	return names, unusedConfigmapNames, nil
 }
 
-func processNamespaceCM(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]string, error) {
+func processNamespaceCM(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]ResourceInfo, error) {
 	volumesCM, envCM, envFromCM, envFromContainerCM, envFromInitContainerCM, err := retrieveUsedCM(clientset, namespace)
+	if err != nil {
+		return nil, err
+	}
+	config, err := unmarshalConfig(configMapsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -142,32 +135,48 @@ func processNamespaceCM(clientset kubernetes.Interface, namespace string, filter
 		usedConfigMaps = append(usedConfigMaps, slice...)
 	}
 
-	diff := CalculateResourceDifference(usedConfigMaps, configMapNames)
-	diff = append(diff, unusedConfigmapNames...)
+	var diff []ResourceInfo
+
+	for _, name := range CalculateResourceDifference(usedConfigMaps, configMapNames) {
+		exceptionFound, err := isResourceException(name, namespace, config.ExceptionConfigMaps)
+		if err != nil {
+			return nil, err
+		}
+
+		if exceptionFound {
+			continue
+		}
+		reason := "ConfigMap is not used in any pod or container"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+
+	for _, name := range unusedConfigmapNames {
+		reason := "Marked with unused label"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
 
 	return diff, nil
-
 }
 
 func GetUnusedConfigmaps(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+	resources := make(map[string]map[string][]ResourceInfo)
 	for _, namespace := range filterOpts.Namespaces(clientset) {
 		diff, err := processNamespaceCM(clientset, namespace, filterOpts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to process namespace %s: %v\n", namespace, err)
 			continue
 		}
-		switch opts.GroupBy {
-		case "namespace":
-			resources[namespace] = make(map[string][]string)
-			resources[namespace]["ConfigMap"] = diff
-		case "resource":
-			appendResources(resources, "ConfigMap", namespace, diff)
-		}
 		if opts.DeleteFlag {
 			if diff, err = DeleteResource(diff, clientset, namespace, "ConfigMap", opts.NoInteractive); err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to delete ConfigMap %s in namespace %s: %v\n", diff, namespace, err)
 			}
+		}
+		switch opts.GroupBy {
+		case "namespace":
+			resources[namespace] = make(map[string][]ResourceInfo)
+			resources[namespace]["ConfigMap"] = diff
+		case "resource":
+			appendResources(resources, "ConfigMap", namespace, diff)
 		}
 	}
 

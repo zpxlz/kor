@@ -9,15 +9,14 @@ import (
 	"github.com/yonahd/kor/pkg/utils"
 )
 
-var jobCmd = &cobra.Command{
-	Use:     "job",
-	Aliases: []string{"jobs"},
-	Short:   "Gets unused jobs",
+var netpolCmd = &cobra.Command{
+	Use:     "networkpolicy",
+	Aliases: []string{"netpol", "networkpolicies"},
+	Short:   "Gets unused networkpolicies",
 	Args:    cobra.ExactArgs(0),
 	Run: func(cmd *cobra.Command, args []string) {
 		clientset := kor.GetKubeClient(kubeconfig)
-
-		if response, err := kor.GetUnusedJobs(filterOptions, clientset, outputFormat, opts); err != nil {
+		if response, err := kor.GetUnusedNetworkPolicies(filterOptions, clientset, outputFormat, opts); err != nil {
 			fmt.Println(err)
 		} else {
 			utils.PrintLogo(outputFormat)
@@ -27,5 +26,5 @@ var jobCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.AddCommand(jobCmd)
+	rootCmd.AddCommand(netpolCmd)
 }
