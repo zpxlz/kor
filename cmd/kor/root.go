@@ -7,7 +7,9 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 	"github.com/yonahd/kor/pkg/kor"
 	"github.com/yonahd/kor/pkg/utils"
@@ -24,12 +26,25 @@ func execName() string {
 
 var rootCmd = &cobra.Command{
 	Use:   execName(),
-	Short: "kor - a CLI to to discover unused Kubernetes resources",
-	Long: `kor is a CLI to to discover unused Kubernetes resources
+	Short: "kor - a CLI to discover unused Kubernetes resources",
+	Long: `kor is a CLI to discover unused Kubernetes resources
 	kor can currently discover unused configmaps and secrets`,
 	Args: cobra.MinimumNArgs(1),
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if shouldSkipKubeInitialization(cmd) {
+			return nil
+		}
+
+		if opts.ClusterName == "" {
+			opts.ClusterName = kor.GetClusterName(kubeconfig)
+		}
+
+		initKindsList()
+		return nil
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		resourceNames := args[0]
+
 		clientset := kor.GetKubeClient(kubeconfig)
 		apiExtClient := kor.GetAPIExtensionsClient(kubeconfig)
 		dynamicClient := kor.GetDynamicClient(kubeconfig)
@@ -37,7 +52,7 @@ var rootCmd = &cobra.Command{
 		if response, err := kor.GetUnusedMulti(resourceNames, filterOptions, clientset, apiExtClient, dynamicClient, outputFormat, opts); err != nil {
 			fmt.Println(err)
 		} else {
-			utils.PrintLogo(outputFormat)
+			utils.PrintLogo(outputFormat, opts.ClusterName)
 			fmt.Println(response)
 		}
 	},
@@ -46,21 +61,61 @@ var rootCmd = &cobra.Command{
 var (
 	outputFormat  string
 	kubeconfig    string
-	opts          kor.Opts
+	opts          common.Opts
 	filterOptions = &filters.Options{}
 )
 
 func init() {
+	initFlags()
+	initViper()
+	addFilterOptionsFlag(rootCmd, filterOptions)
+}
+
+func initKindsList() {
+	// Only initialize if not already done
+	if kor.ResourceKindList == nil {
+		clientset := kor.GetKubeClient(kubeconfig)
+		kor.ResourceKindList, _ = kor.GetResourceKinds(clientset)
+	}
+}
+
+func initFlags() {
 	rootCmd.PersistentFlags().StringVarP(&kubeconfig, "kubeconfig", "k", "", "Path to kubeconfig file (optional)")
 	rootCmd.PersistentFlags().StringVarP(&outputFormat, "output", "o", "table", "Output format (table, json or yaml)")
 	rootCmd.PersistentFlags().StringVar(&opts.WebhookURL, "slack-webhook-url", "", "Slack webhook URL to send notifications to")
-	rootCmd.PersistentFlags().StringVar(&opts.Channel, "slack-channel", "", "Slack channel to send notifications to. --slack-channel requires --slack-auth-token to be set.")
-	rootCmd.PersistentFlags().StringVar(&opts.Token, "slack-auth-token", "", "Slack auth token to send notifications to. --slack-auth-token requires --slack-channel to be set.")
+	rootCmd.PersistentFlags().StringVar(&opts.Channel, "slack-channel", "", "Slack channel to send notifications to, requires --slack-auth-token to be set")
+	rootCmd.PersistentFlags().StringVar(&opts.Token, "slack-auth-token", "", "Slack auth token to send notifications to, requires --slack-channel to be set")
+	rootCmd.PersistentFlags().StringVar(&opts.ClusterName, "cluster-name", "", "Override the cluster name shown in CLI output and Slack notifications")
 	rootCmd.PersistentFlags().BoolVar(&opts.DeleteFlag, "delete", false, "Delete unused resources")
-	rootCmd.PersistentFlags().BoolVar(&opts.NoInteractive, "no-interactive", false, "Do not prompt for confirmation when deleting resources. Be careful using this flag!")
+	rootCmd.PersistentFlags().BoolVar(&opts.NoInteractive, "no-interactive", false, "Do not prompt for confirmation when deleting resources. Be careful when using this flag!")
 	rootCmd.PersistentFlags().BoolVarP(&opts.Verbose, "verbose", "v", false, "Verbose output (print empty namespaces)")
 	rootCmd.PersistentFlags().StringVar(&opts.GroupBy, "group-by", "namespace", "Group output by (namespace, resource)")
-	addFilterOptionsFlag(rootCmd, filterOptions)
+	rootCmd.PersistentFlags().BoolVar(&opts.ShowReason, "show-reason", false, "Print reason resource is considered unused")
+}
+
+func initViper() {
+	if err := viper.BindEnv("slack-webhook-url", "SLACK_WEBHOOK_URL"); err != nil {
+		fmt.Printf("Error binding SLACK_WEBHOOK_URL: %v\n", err)
+	}
+	if err := viper.BindEnv("slack-auth-token", "SLACK_AUTH_TOKEN"); err != nil {
+		fmt.Printf("Error binding SLACK_AUTH_TOKEN: %v\n", err)
+	}
+
+	viper.AutomaticEnv()
+
+	if err := viper.BindPFlag("slack-webhook-url", rootCmd.PersistentFlags().Lookup("slack-webhook-url")); err != nil {
+		fmt.Printf("Error binding flag --slack-webhook-url: %v\n", err)
+	}
+
+	if err := viper.BindPFlag("slack-auth-token", rootCmd.PersistentFlags().Lookup("slack-auth-token")); err != nil {
+		fmt.Printf("Error binding flag --slack-auth-token: %v\n", err)
+	}
+
+	opts.WebhookURL = viper.GetString("slack-webhook-url")
+	opts.Token = viper.GetString("slack-auth-token")
+
+	opts.WebhookURL = os.ExpandEnv(opts.WebhookURL)
+	opts.Token = os.ExpandEnv(opts.Token)
 }
 
 func Execute() {
@@ -77,10 +132,34 @@ func Execute() {
 }
 
 func addFilterOptionsFlag(cmd *cobra.Command, opts *filters.Options) {
-	cmd.PersistentFlags().StringSliceVarP(&opts.ExcludeLabels, "exclude-labels", "l", opts.ExcludeLabels, "Selector to filter out, Example: --exclude-labels key1=value1,key2=value2. If --include-labels is set, --exclude-labels will be ignored.")
+	cmd.PersistentFlags().StringSliceVarP(&opts.ExcludeLabels, "exclude-labels", "l", opts.ExcludeLabels, "Selector to filter out, Example: --exclude-labels key1=value1,key2=value2. If --include-labels is set, --exclude-labels will be ignored")
 	cmd.PersistentFlags().StringVar(&opts.NewerThan, "newer-than", opts.NewerThan, "The maximum age of the resources to be considered unused. This flag cannot be used together with older-than flag. Example: --newer-than=1h2m")
 	cmd.PersistentFlags().StringVar(&opts.OlderThan, "older-than", opts.OlderThan, "The minimum age of the resources to be considered unused. This flag cannot be used together with newer-than flag. Example: --older-than=1h2m")
-	cmd.PersistentFlags().StringVar(&opts.IncludeLabels, "include-labels", opts.IncludeLabels, "Selector to filter in, Example: --include-labels key1=value1.(currently supports one label)")
-	cmd.PersistentFlags().StringSliceVarP(&opts.ExcludeNamespaces, "exclude-namespaces", "e", opts.ExcludeNamespaces, "Namespaces to be excluded, split by commas. Example: --exclude-namespaces ns1,ns2,ns3. If --include-namespaces is set, --exclude-namespaces will be ignored.")
-	cmd.PersistentFlags().StringSliceVarP(&opts.IncludeNamespaces, "include-namespaces", "n", opts.IncludeNamespaces, "Namespaces to run on, split by commas. Example: --include-namespaces ns1,ns2,ns3. If set, non-namespaced resources will be ignored.")
+	cmd.PersistentFlags().StringVar(&opts.IncludeLabels, "include-labels", opts.IncludeLabels, "Selector to filter in, Example: --include-labels key1=value1 (currently supports one label)")
+	cmd.PersistentFlags().StringSliceVarP(&opts.ExcludeNamespaces, "exclude-namespaces", "e", opts.ExcludeNamespaces, "Namespaces to be excluded, split by commas. Example: --exclude-namespaces ns1,ns2,ns3. If --include-namespaces is set, --exclude-namespaces will be ignored")
+	cmd.PersistentFlags().StringSliceVarP(&opts.IncludeNamespaces, "include-namespaces", "n", opts.IncludeNamespaces, "Namespaces to run on, split by commas. Example: --include-namespaces ns1,ns2,ns3. If set, non-namespaced resources will be ignored")
+	cmd.PersistentFlags().BoolVar(&opts.IgnoreOwnerReferences, "ignore-owner-references", false, "Skip resources that have ownerReferences set (for all resource types)")
+	cmd.PersistentFlags().BoolVar(&opts.SkipNamespaceValidation, "skip-namespace-validation", false, "Skip namespace existence validation (requires --include-namespaces). Use in permission-limited clusters with only Role/RoleBinding")
+}
+
+// shouldSkipKubeInitialization determines if a command should skip kubeconfig initialization.
+func shouldSkipKubeInitialization(cmd *cobra.Command) bool {
+	cmdName := cmd.Name()
+
+	if cmdName == "version" || cmdName == "help" || cmdName == "completion" {
+		return true
+	}
+
+	if cmd.Parent() != nil && cmd.Parent().Name() == "completion" {
+		return true
+	}
+
+	shellCompletionCommands := []string{"bash", "zsh", "fish", "powershell"}
+	for _, shellCmd := range shellCompletionCommands {
+		if cmdName == shellCmd {
+			return true
+		}
+	}
+
+	return false
 }

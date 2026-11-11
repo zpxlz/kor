@@ -13,11 +13,12 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 func createTestDeployments(t *testing.T) *fake.Clientset {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
 		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
@@ -57,7 +58,7 @@ func createTestDeployments(t *testing.T) *fake.Clientset {
 func TestProcessNamespaceDeployments(t *testing.T) {
 	clientset := createTestDeployments(t)
 
-	deploymentsWithoutReplicas, err := processNamespaceDeployments(clientset, testNamespace, &filters.Options{})
+	deploymentsWithoutReplicas, err := processNamespaceDeployments(clientset, testNamespace, &filters.Options{}, common.Opts{})
 	if err != nil {
 		t.Errorf("Expected no error, got %v", err)
 	}
@@ -66,7 +67,7 @@ func TestProcessNamespaceDeployments(t *testing.T) {
 		t.Errorf("Expected 1 deployment without replicas, got %d", len(deploymentsWithoutReplicas))
 	}
 
-	if deploymentsWithoutReplicas[0] != "test-deployment1" && deploymentsWithoutReplicas[1] != "test-deployment4" {
+	if deploymentsWithoutReplicas[0].Name != "test-deployment1" && deploymentsWithoutReplicas[1].Name != "test-deployment4" {
 		t.Errorf("Expected 'test-deployment1', 'test-deployment4',got %s, %s", deploymentsWithoutReplicas[0], deploymentsWithoutReplicas[1])
 	}
 }
@@ -74,7 +75,7 @@ func TestProcessNamespaceDeployments(t *testing.T) {
 func TestGetUnusedDeploymentsStructured(t *testing.T) {
 	clientset := createTestDeployments(t)
 
-	opts := Opts{
+	opts := common.Opts{
 		WebhookURL:    "",
 		Channel:       "",
 		Token:         "",
@@ -104,6 +105,68 @@ func TestGetUnusedDeploymentsStructured(t *testing.T) {
 
 	if !reflect.DeepEqual(expectedOutput, actualOutput) {
 		t.Errorf("Expected output does not match actual output")
+	}
+}
+
+func TestFilterOwnerReferencedDeployments(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
+		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
+	}, v1.CreateOptions{})
+
+	if err != nil {
+		t.Fatalf("Error creating namespace %s: %v", testNamespace, err)
+	}
+
+	// Create two deployments - one owned by another resource, one standalone
+	// Deployment owned by another resource
+	ownedDeployment := CreateTestDeployment(testNamespace, "owned-deployment", 0, AppLabels)
+	// Add owner reference to another resource
+	ownedDeployment.OwnerReferences = []v1.OwnerReference{
+		{
+			Kind: "Application",
+			Name: "test-application",
+		},
+	}
+
+	// Standalone Deployment
+	standaloneDeployment := CreateTestDeployment(testNamespace, "standalone-deployment", 0, AppLabels)
+
+	_, err = clientset.AppsV1().Deployments(testNamespace).Create(context.TODO(), ownedDeployment, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake deployment: %v", err)
+	}
+
+	_, err = clientset.AppsV1().Deployments(testNamespace).Create(context.TODO(), standaloneDeployment, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake deployment: %v", err)
+	}
+
+	// Test without filter - should return both
+	filterOptsNoSkip := &filters.Options{IgnoreOwnerReferences: false}
+	unusedWithoutFilter, err := processNamespaceDeployments(clientset, testNamespace, filterOptsNoSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused deployments: %v", err)
+	}
+
+	if len(unusedWithoutFilter) != 2 {
+		t.Errorf("Expected 2 unused Deployment objects without filter, got %d", len(unusedWithoutFilter))
+	}
+
+	// Test with filter - should return only standalone
+	filterOptsWithSkip := &filters.Options{IgnoreOwnerReferences: true}
+	unusedWithFilter, err := processNamespaceDeployments(clientset, testNamespace, filterOptsWithSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused deployments: %v", err)
+	}
+
+	if len(unusedWithFilter) != 1 {
+		t.Errorf("Expected 1 unused Deployment object with filter, got %d", len(unusedWithFilter))
+	}
+
+	if unusedWithFilter[0].Name != "standalone-deployment" {
+		t.Errorf("Expected standalone-deployment to be unused, got %s", unusedWithFilter[0].Name)
 	}
 }
 

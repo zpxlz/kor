@@ -1,8 +1,14 @@
 {
   "exceptionConfigMaps": [
     {
-      "Namespace": "*",
-      "ResourceName": "kube-root-ca.crt"
+      "Namespace": ".*",
+      "ResourceName": "kube-root-ca\\.crt",
+      "MatchRegex": true
+    },
+    {
+      "Namespace": ".*",
+      "ResourceName": "openshift-service-ca\\.crt",
+      "MatchRegex": true
     },
     {
       "Namespace": "gmp-system",
@@ -26,7 +32,15 @@
     },
     {
       "Namespace": "kube-system",
+      "ResourceName": "bootstrap"
+    },
+    {
+      "Namespace": "kube-system",
       "ResourceName": "cluster-autoscaler-status"
+    },
+    {
+      "Namespace": "kube-system",
+      "ResourceName": "cluster-config-v1"
     },
     {
       "Namespace": "kube-system",
@@ -93,8 +107,45 @@
       "ResourceName": "overlay-upgrade-data"
     },
     {
+      "Namespace": "kube-system",
+      "ResourceName": "root-ca"
+    },
+    {
       "Namespace": "kubernetes-dashboard",
       "ResourceName": "kubernetes-dashboard-settings"
+    },
+    {
+      "Namespace": "openshift-.*",
+      "ResourceName": ".*",
+      "MatchRegex": true
+    },
+    {
+      "Namespace": "gke-managed-system",
+      "ResourceName": "dcgm-exporter-metrics"
+    },
+    {
+      "Namespace": "gmp-system",
+      "ResourceName": "rule-evaluator"
+    },
+    {
+      "Namespace": "gmp-system",
+      "ResourceName": "rules-generated"
+    },
+    {
+      "Namespace": "kube-system",
+      "ResourceName": "efficiency-daemon-config"
+    },
+    {
+      "Namespace": "kube-system",
+      "ResourceName": "metrics-agent-linux-config-images"
+    },
+    {
+      "Namespace": "kube-system",
+      "ResourceName": "metrics-agent-windows-config-images"
+    },
+    {
+      "Namespace": "kube-system",
+      "ResourceName": "nvidia-metrics-collector-config-map"
     }
   ]
 }

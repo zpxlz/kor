@@ -14,60 +14,100 @@ import (
 	"k8s.io/client-go/dynamic"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 //go:embed exceptions/crds/crds.json
 var crdsConfig []byte
 
-func processCrds(apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, filterOpts *filters.Options) ([]string, error) {
-
-	var unusedCRDs []string
+func processCrds(apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, filterOpts *filters.Options) ([]ResourceInfo, error) {
+	var unusedCRDs []ResourceInfo
 
 	crds, err := apiExtClient.ApiextensionsV1().CustomResourceDefinitions().List(context.TODO(), metav1.ListOptions{LabelSelector: filterOpts.IncludeLabels})
 	if err != nil {
 		return nil, err
 	}
 
+	config, err := unmarshalConfig(crdsConfig)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, crd := range crds.Items {
-		if pass := filters.KorLabelFilter(&crd, &filters.Options{}); pass {
+		// Skip resources with ownerReferences if the general flag is set
+		if filterOpts.IgnoreOwnerReferences && len(crd.OwnerReferences) > 0 {
 			continue
 		}
 
-		config, err := unmarshalConfig(crdsConfig)
+		if pass, _ := filter.SetObject(&crd).Run(filterOpts); pass {
+			continue
+		}
+
+		if crd.Labels["kor/used"] == "false" {
+			reason := "Marked with unused label"
+			unusedCRDs = append(unusedCRDs, ResourceInfo{Name: crd.Name, Reason: reason})
+			continue
+		}
+
+		exceptionFound, err := isResourceException(crd.Name, crd.Namespace, config.ExceptionCrds)
 		if err != nil {
 			return nil, err
 		}
 
-		if isResourceException(crd.Name, crd.Namespace, config.ExceptionCrds) {
+		if exceptionFound {
 			continue
 		}
 
-		gvr := schema.GroupVersionResource{
-			Group:    crd.Spec.Group,
-			Version:  crd.Spec.Versions[0].Name, // We're checking the first version.
-			Resource: crd.Spec.Names.Plural,
+		// Instead of finding just one served version, iterate over all served versions
+		servedVersions := []string{}
+		for _, v := range crd.Spec.Versions {
+			if v.Served {
+				servedVersions = append(servedVersions, v.Name)
+			}
 		}
-		instances, err := dynamicClient.Resource(gvr).Namespace("").List(context.TODO(), metav1.ListOptions{LabelSelector: filterOpts.IncludeLabels})
-		if err != nil {
-			return nil, err
+
+		// Skip this CRD if no served versions are found
+		if len(servedVersions) == 0 {
+			continue
 		}
-		if len(instances.Items) == 0 {
-			unusedCRDs = append(unusedCRDs, crd.Name)
+
+		foundInstances := false
+
+		for _, version := range servedVersions {
+			gvr := schema.GroupVersionResource{
+				Group:    crd.Spec.Group,
+				Version:  version,
+				Resource: crd.Spec.Names.Plural,
+			}
+			instances, err := dynamicClient.Resource(gvr).Namespace("").List(context.TODO(), metav1.ListOptions{LabelSelector: filterOpts.IncludeLabels})
+			if err != nil {
+				// If we get an error querying the resource, skip this version
+				continue
+			}
+			if len(instances.Items) > 0 {
+				foundInstances = true
+				break
+			}
+		}
+
+		if !foundInstances {
+			reason := "CRD has no instances"
+			unusedCRDs = append(unusedCRDs, ResourceInfo{Name: crd.Name, Reason: reason})
 		}
 	}
 	return unusedCRDs, nil
 }
 
-func GetUnusedCrds(_ *filters.Options, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+func GetUnusedCrds(_ *filters.Options, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
 	diff, err := processCrds(apiExtClient, dynamicClient, &filters.Options{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to process crds: %v\n", err)
 	}
 	switch opts.GroupBy {
 	case "namespace":
-		resources[""] = make(map[string][]string)
+		resources[""] = make(map[string][]ResourceInfo)
 		resources[""]["Crd"] = diff
 	case "resource":
 		appendResources(resources, "Crd", "", diff)

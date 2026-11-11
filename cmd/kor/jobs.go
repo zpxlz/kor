@@ -11,7 +11,7 @@ import (
 
 var jobCmd = &cobra.Command{
 	Use:     "job",
-	Aliases: []string{"job", "jobs"},
+	Aliases: []string{"jobs"},
 	Short:   "Gets unused jobs",
 	Args:    cobra.ExactArgs(0),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -20,7 +20,7 @@ var jobCmd = &cobra.Command{
 		if response, err := kor.GetUnusedJobs(filterOptions, clientset, outputFormat, opts); err != nil {
 			fmt.Println(err)
 		} else {
-			utils.PrintLogo(outputFormat)
+			utils.PrintLogo(outputFormat, opts.ClusterName)
 			fmt.Println(response)
 		}
 	},

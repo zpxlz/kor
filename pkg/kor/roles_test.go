@@ -13,11 +13,12 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 func createTestRoles(t *testing.T) *fake.Clientset {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
 		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
@@ -63,7 +64,7 @@ func createTestRoles(t *testing.T) *fake.Clientset {
 func TestRetrieveUsedRoles(t *testing.T) {
 	clientset := createTestRoles(t)
 
-	usedRoles, err := retrieveUsedRoles(clientset, testNamespace, &filters.Options{})
+	usedRoles, err := retrieveUsedRoles(clientset, testNamespace)
 	if err != nil {
 		t.Errorf("Expected no error, got %v", err)
 	}
@@ -92,7 +93,7 @@ func TestRetrieveRoleNames(t *testing.T) {
 func TestProcessNamespaceRoles(t *testing.T) {
 	clientset := createTestRoles(t)
 
-	unusedRoles, err := processNamespaceRoles(clientset, testNamespace, &filters.Options{})
+	unusedRoles, err := processNamespaceRoles(clientset, testNamespace, &filters.Options{}, common.Opts{})
 	if err != nil {
 		t.Errorf("Expected no error, got %v", err)
 	}
@@ -101,7 +102,7 @@ func TestProcessNamespaceRoles(t *testing.T) {
 		t.Errorf("Expected 2 unused roles, got %d", len(unusedRoles))
 	}
 
-	if unusedRoles[0] != "test-role2" || unusedRoles[1] != "test-role4" {
+	if unusedRoles[0].Name != "test-role2" || unusedRoles[1].Name != "test-role4" {
 		t.Errorf("Expected 'test-role2', 'test-role4', got %s %s", unusedRoles[0], unusedRoles[1])
 	}
 }
@@ -109,7 +110,7 @@ func TestProcessNamespaceRoles(t *testing.T) {
 func TestGetUnusedRolesStructured(t *testing.T) {
 	clientset := createTestRoles(t)
 
-	opts := Opts{
+	opts := common.Opts{
 		WebhookURL:    "",
 		Channel:       "",
 		Token:         "",
@@ -139,6 +140,68 @@ func TestGetUnusedRolesStructured(t *testing.T) {
 
 	if !reflect.DeepEqual(expectedOutput, actualOutput) {
 		t.Errorf("Expected output does not match actual output")
+	}
+}
+
+func TestFilterOwnerReferencedRoles(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
+		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
+	}, v1.CreateOptions{})
+
+	if err != nil {
+		t.Fatalf("Error creating namespace %s: %v", testNamespace, err)
+	}
+
+	// Create two roles - one owned by another resource, one standalone
+	// Role owned by another resource
+	ownedRole := CreateTestRole(testNamespace, "owned-role", AppLabels)
+	// Add owner reference to another resource
+	ownedRole.OwnerReferences = []v1.OwnerReference{
+		{
+			Kind: "Application",
+			Name: "test-application",
+		},
+	}
+
+	// Standalone Role
+	standaloneRole := CreateTestRole(testNamespace, "standalone-role", AppLabels)
+
+	_, err = clientset.RbacV1().Roles(testNamespace).Create(context.TODO(), ownedRole, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake Role: %v", err)
+	}
+
+	_, err = clientset.RbacV1().Roles(testNamespace).Create(context.TODO(), standaloneRole, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake Role: %v", err)
+	}
+
+	// Test without filter - should return both
+	filterOptsNoSkip := &filters.Options{IgnoreOwnerReferences: false}
+	unusedWithoutFilter, err := processNamespaceRoles(clientset, testNamespace, filterOptsNoSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused Roles: %v", err)
+	}
+
+	if len(unusedWithoutFilter) != 2 {
+		t.Errorf("Expected 2 unused Role objects without filter, got %d", len(unusedWithoutFilter))
+	}
+
+	// Test with filter - should return only standalone
+	filterOptsWithSkip := &filters.Options{IgnoreOwnerReferences: true}
+	unusedWithFilter, err := processNamespaceRoles(clientset, testNamespace, filterOptsWithSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused Roles: %v", err)
+	}
+
+	if len(unusedWithFilter) != 1 {
+		t.Errorf("Expected 1 unused Role object with filter, got %d", len(unusedWithFilter))
+	}
+
+	if unusedWithFilter[0].Name != "standalone-role" {
+		t.Errorf("Expected standalone-role to be unused, got %s", unusedWithFilter[0].Name)
 	}
 }
 

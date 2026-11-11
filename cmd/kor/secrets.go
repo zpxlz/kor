@@ -11,7 +11,7 @@ import (
 
 var secretCmd = &cobra.Command{
 	Use:     "secret",
-	Aliases: []string{"scrt", "secrets"},
+	Aliases: []string{"secrets"},
 	Short:   "Gets unused secrets",
 	Args:    cobra.NoArgs,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -20,7 +20,7 @@ var secretCmd = &cobra.Command{
 		if response, err := kor.GetUnusedSecrets(filterOptions, clientset, outputFormat, opts); err != nil {
 			fmt.Println(err)
 		} else {
-			utils.PrintLogo(outputFormat)
+			utils.PrintLogo(outputFormat, opts.ClusterName)
 			fmt.Println(response)
 		}
 	},

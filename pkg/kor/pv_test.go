@@ -9,11 +9,12 @@ import (
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 func createTestPvs(t *testing.T) *fake.Clientset {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	pv1 := CreateTestPv("test-pv1", "Bound", AppLabels, "test-sc1")
 	_, err := clientset.CoreV1().PersistentVolumes().Create(context.TODO(), pv1, v1.CreateOptions{})
@@ -53,7 +54,7 @@ func TestProcessPvs(t *testing.T) {
 		t.Errorf("Expected 2 used pv, got %d", len(usedPvs))
 	}
 
-	if usedPvs[0] != "test-pv2" && usedPvs[1] != "test-pv3" {
+	if usedPvs[0].Name != "test-pv2" && usedPvs[1].Name != "test-pv3" {
 		t.Errorf("Expected 'test-pv2', got %s", usedPvs[0])
 	}
 }
@@ -61,7 +62,7 @@ func TestProcessPvs(t *testing.T) {
 func TestGetUnusedPvs(t *testing.T) {
 	clientset := createTestPvs(t)
 
-	opts := Opts{
+	opts := common.Opts{
 		WebhookURL:    "",
 		Channel:       "",
 		Token:         "",

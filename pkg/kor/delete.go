@@ -51,6 +51,9 @@ func DeleteResourceCmd() map[string]func(clientset kubernetes.Interface, namespa
 		"ClusterRole": func(clientset kubernetes.Interface, namespace, name string) error {
 			return clientset.RbacV1().ClusterRoles().Delete(context.TODO(), name, metav1.DeleteOptions{})
 		},
+		"ClusterRoleBinding": func(clientset kubernetes.Interface, namespace, name string) error {
+			return clientset.RbacV1().ClusterRoleBindings().Delete(context.TODO(), name, metav1.DeleteOptions{})
+		},
 		"PVC": func(clientset kubernetes.Interface, namespace, name string) error {
 			return clientset.CoreV1().PersistentVolumeClaims(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
 		},
@@ -77,6 +80,18 @@ func DeleteResourceCmd() map[string]func(clientset kubernetes.Interface, namespa
 		},
 		"StorageClass": func(clientset kubernetes.Interface, namespace, name string) error {
 			return clientset.StorageV1().StorageClasses().Delete(context.TODO(), name, metav1.DeleteOptions{})
+		},
+		"NetworkPolicy": func(clientset kubernetes.Interface, namespace, name string) error {
+			return clientset.NetworkingV1().NetworkPolicies(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
+		},
+		"RoleBinding": func(clientset kubernetes.Interface, namespace, name string) error {
+			return clientset.RbacV1().RoleBindings(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
+		},
+		"VolumeAttachment": func(clientset kubernetes.Interface, namespace, name string) error {
+			return clientset.StorageV1().VolumeAttachments().Delete(context.TODO(), name, metav1.DeleteOptions{})
+		},
+		"PriorityClass": func(clientset kubernetes.Interface, namespace, name string) error {
+			return clientset.SchedulingV1().PriorityClasses().Delete(context.TODO(), name, metav1.DeleteOptions{})
 		},
 	}
 
@@ -147,6 +162,8 @@ func updateResource(clientset kubernetes.Interface, namespace, resourceType stri
 		return clientset.RbacV1().Roles(namespace).Update(context.TODO(), resource.(*rbacv1.Role), metav1.UpdateOptions{})
 	case "ClusterRole":
 		return clientset.RbacV1().ClusterRoles().Update(context.TODO(), resource.(*rbacv1.ClusterRole), metav1.UpdateOptions{})
+	case "ClusterRoleBinding":
+		return clientset.RbacV1().ClusterRoleBindings().Update(context.TODO(), resource.(*rbacv1.ClusterRoleBinding), metav1.UpdateOptions{})
 	case "PVC":
 		return clientset.CoreV1().PersistentVolumeClaims(namespace).Update(context.TODO(), resource.(*corev1.PersistentVolumeClaim), metav1.UpdateOptions{})
 	case "StatefulSet":
@@ -165,6 +182,12 @@ func updateResource(clientset kubernetes.Interface, namespace, resourceType stri
 		return clientset.AppsV1().DaemonSets(namespace).Update(context.TODO(), resource.(*appsv1.DaemonSet), metav1.UpdateOptions{})
 	case "StorageClass":
 		return clientset.StorageV1().StorageClasses().Update(context.TODO(), resource.(*storagev1.StorageClass), metav1.UpdateOptions{})
+	case "NetworkPolicy":
+		return clientset.NetworkingV1().NetworkPolicies(namespace).Update(context.TODO(), resource.(*networkingv1.NetworkPolicy), metav1.UpdateOptions{})
+	case "RoleBinding":
+		return clientset.RbacV1().RoleBindings(namespace).Update(context.TODO(), resource.(*rbacv1.RoleBinding), metav1.UpdateOptions{})
+	case "VolumeAttachment":
+		return clientset.StorageV1().VolumeAttachments().Update(context.TODO(), resource.(*storagev1.VolumeAttachment), metav1.UpdateOptions{})
 	}
 	return nil, fmt.Errorf("resource type '%s' is not supported", resourceType)
 }
@@ -189,6 +212,8 @@ func getResource(clientset kubernetes.Interface, namespace, resourceType, resour
 		return clientset.RbacV1().Roles(namespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
 	case "ClusterRole":
 		return clientset.RbacV1().ClusterRoles().Get(context.TODO(), resourceName, metav1.GetOptions{})
+	case "ClusterRoleBinding":
+		return clientset.RbacV1().ClusterRoleBindings().Get(context.TODO(), resourceName, metav1.GetOptions{})
 	case "PVC":
 		return clientset.CoreV1().PersistentVolumeClaims(namespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
 	case "StatefulSet":
@@ -207,17 +232,21 @@ func getResource(clientset kubernetes.Interface, namespace, resourceType, resour
 		return clientset.AppsV1().DaemonSets(namespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
 	case "StorageClass":
 		return clientset.StorageV1().StorageClasses().Get(context.TODO(), resourceName, metav1.GetOptions{})
+	case "NetworkPolicy":
+		return clientset.NetworkingV1().NetworkPolicies(namespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
+	case "RoleBinding":
+		return clientset.RbacV1().RoleBindings(namespace).Get(context.TODO(), resourceName, metav1.GetOptions{})
+	case "volumeAttachment":
+		return clientset.StorageV1().VolumeAttachments().Get(context.TODO(), resourceName, metav1.GetOptions{})
 	}
 	return nil, fmt.Errorf("resource type '%s' is not supported", resourceType)
 }
 
-func DeleteResourceWithFinalizer(diff []string, dynamicClient dynamic.Interface, namespace string, gvr schema.GroupVersionResource, noInteractive bool) ([]string, error) {
-	deletedDiff := []string{}
-
-	for _, resourceName := range diff {
-
+func DeleteResourceWithFinalizer(resources []ResourceInfo, dynamicClient dynamic.Interface, namespace string, gvr schema.GroupVersionResource, noInteractive bool) ([]ResourceInfo, error) {
+	var remainingResources []ResourceInfo
+	for _, resource := range resources {
 		if !noInteractive {
-			fmt.Printf("Do you want to delete %s %s in namespace %s? (Y/N): ", gvr.Resource, resourceName, namespace)
+			fmt.Printf("Do you want to delete %s %s in namespace %s? (Y/N): ", gvr.Resource, resource.Name, namespace)
 			var confirmation string
 			_, err := fmt.Scanf("%s", &confirmation)
 			if err != nil {
@@ -226,75 +255,78 @@ func DeleteResourceWithFinalizer(diff []string, dynamicClient dynamic.Interface,
 			}
 
 			if strings.ToLower(confirmation) != "y" && strings.ToLower(confirmation) != "yes" {
-				deletedDiff = append(deletedDiff, resourceName)
+				resource.Reason = "not deleted - user declined"
+				remainingResources = append(remainingResources, resource)
 
-				fmt.Printf("Do you want flag the resource %s %s in namespace %s as In Use? (Y/N): ", gvr.Resource, resourceName, namespace)
+				fmt.Printf("Do you want to flag the resource %s %s in namespace %s as In Use? (Y/N): ", gvr.Resource, resource.Name, namespace)
 				var inUse string
-				_, err := fmt.Scanf("%s", &inUse)
+				_, err = fmt.Scanf("%s", &inUse)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Failed to read input: %v\n", err)
 					continue
 				}
 
 				if strings.ToLower(inUse) == "y" || strings.ToLower(inUse) == "yes" {
-					if err := FlagDynamicResource(dynamicClient, namespace, gvr, resourceName); err != nil {
-						fmt.Fprintf(os.Stderr, "Failed to flag resource %s %s in namespace %s as In Use: %v\n", gvr.Resource, resourceName, namespace, err)
+					if err := FlagDynamicResource(dynamicClient, namespace, gvr, resource.Name); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to flag resource %s %s in namespace %s as In Use: %v\n", gvr.Resource, resource.Name, namespace, err)
+					} else {
+						resource.Reason = "flagged as in use"
 					}
-					continue
 				}
 				continue
 			}
 		}
 
-		fmt.Printf("Deleting %s %s in namespace %s\n", gvr.Resource, resourceName, namespace)
+		fmt.Printf("Deleting %s %s in namespace %s\n", gvr.Resource, resource.Name, namespace)
 		if _, err := dynamicClient.
 			Resource(gvr).
 			Namespace(namespace).
-			Patch(context.TODO(), resourceName, types.MergePatchType,
+			Patch(context.TODO(), resource.Name, types.MergePatchType,
 				[]byte(`{"metadata":{"finalizers":null}}`),
 				metav1.PatchOptions{}); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to delete %s %s in namespace %s: %v\n", gvr.Resource, resourceName, namespace, err)
+			fmt.Fprintf(os.Stderr, "Failed to delete %s %s in namespace %s: %v\n", gvr.Resource, resource.Name, namespace, err)
 			continue
 		}
-		deletedDiff = append(deletedDiff, resourceName+"-DELETED")
+		resource.Name = resource.Name + "-DELETED"
+		remainingResources = append(remainingResources, resource)
 	}
 
-	return deletedDiff, nil
+	return remainingResources, nil
 }
 
-func DeleteResource(diff []string, clientset kubernetes.Interface, namespace, resourceType string, noInteractive bool) ([]string, error) {
-	deletedDiff := []string{}
+func DeleteResource(diff []ResourceInfo, clientset kubernetes.Interface, namespace, resourceType string, noInteractive bool) ([]ResourceInfo, error) {
+	deletedDiff := []ResourceInfo{}
 
-	for _, resourceName := range diff {
+	for _, resource := range diff {
 		deleteFunc, exists := DeleteResourceCmd()[resourceType]
 		if !exists {
-			fmt.Printf("Resource type '%s' is not supported\n", resourceName)
+			fmt.Printf("Resource type '%s' is not supported\n", resource.Name)
 			continue
 		}
 
 		if !noInteractive {
-			fmt.Printf("Do you want to delete %s %s in namespace %s? (Y/N): ", resourceType, resourceName, namespace)
+			fmt.Printf("Do you want to delete %s %s in namespace %s? (Y/N): ", resourceType, resource.Name, namespace)
 			var confirmation string
-			_, err := fmt.Scanf("%s", &confirmation)
+			_, err := fmt.Scanf("%s\n", &confirmation)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to read input: %v\n", err)
 				continue
 			}
 
 			if strings.ToLower(confirmation) != "y" && strings.ToLower(confirmation) != "yes" {
-				deletedDiff = append(deletedDiff, resourceName)
+				deletedDiff = append(deletedDiff, resource)
 
-				fmt.Printf("Do you want flag the resource %s %s in namespace %s as In Use? (Y/N): ", resourceType, resourceName, namespace)
+				fmt.Printf("Do you want flag the resource %s %s in namespace %s as In Use? (Y/N): ", resourceType, resource.Name, namespace)
 				var inUse string
-				_, err := fmt.Scanf("%s", &inUse)
+				_, err := fmt.Scanf("%s\n", &inUse)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Failed to read input: %v\n", err)
 					continue
 				}
 
 				if strings.ToLower(inUse) == "y" || strings.ToLower(inUse) == "yes" {
-					if err := FlagResource(clientset, namespace, resourceType, resourceName); err != nil {
-						fmt.Fprintf(os.Stderr, "Failed to flag resource %s %s in namespace %s as In Use: %v\n", resourceType, resourceName, namespace, err)
+					if err := FlagResource(clientset, namespace, resourceType, resource.Name); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to flag resource %s %s in namespace %s as In Use: %v\n", resourceType, resource.Name, namespace, err)
 					}
 					continue
 				}
@@ -302,12 +334,14 @@ func DeleteResource(diff []string, clientset kubernetes.Interface, namespace, re
 			}
 		}
 
-		fmt.Printf("Deleting %s %s in namespace %s\n", resourceType, resourceName, namespace)
-		if err := deleteFunc(clientset, namespace, resourceName); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to delete %s %s in namespace %s: %v\n", resourceType, resourceName, namespace, err)
+		fmt.Printf("Deleting %s %s in namespace %s\n", resourceType, resource.Name, namespace)
+		if err := deleteFunc(clientset, namespace, resource.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to delete %s %s in namespace %s: %v\n", resourceType, resource.Name, namespace, err)
 			continue
 		}
-		deletedDiff = append(deletedDiff, resourceName+"-DELETED")
+		deletedResource := resource
+		deletedResource.Name += "-DELETED"
+		deletedDiff = append(deletedDiff, deletedResource)
 	}
 
 	return deletedDiff, nil

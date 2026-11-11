@@ -13,11 +13,12 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 func createTestStatefulSets(t *testing.T) *fake.Clientset {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
 		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
@@ -57,7 +58,7 @@ func createTestStatefulSets(t *testing.T) *fake.Clientset {
 func TestProcessNamespaceStatefulSets(t *testing.T) {
 	clientset := createTestStatefulSets(t)
 
-	statefulSetsWithoutReplicas, err := processNamespaceStatefulSets(clientset, testNamespace, &filters.Options{})
+	statefulSetsWithoutReplicas, err := processNamespaceStatefulSets(clientset, testNamespace, &filters.Options{}, common.Opts{})
 	if err != nil {
 		t.Errorf("Expected no error, got %v", err)
 	}
@@ -66,7 +67,7 @@ func TestProcessNamespaceStatefulSets(t *testing.T) {
 		t.Errorf("Expected 2 deployment without replicas, got %d", len(statefulSetsWithoutReplicas))
 	}
 
-	if statefulSetsWithoutReplicas[0] != "test-sts1" || statefulSetsWithoutReplicas[1] != "test-sts4" {
+	if statefulSetsWithoutReplicas[0].Name != "test-sts1" || statefulSetsWithoutReplicas[1].Name != "test-sts4" {
 		t.Errorf("Expected 'test-sts1' and 'test-sts4, got %s, %s", statefulSetsWithoutReplicas[0], statefulSetsWithoutReplicas[1])
 	}
 }
@@ -74,7 +75,7 @@ func TestProcessNamespaceStatefulSets(t *testing.T) {
 func TestGetUnusedStatefulSetsStructured(t *testing.T) {
 	clientset := createTestStatefulSets(t)
 
-	opts := Opts{
+	opts := common.Opts{
 		WebhookURL:    "",
 		Channel:       "",
 		Token:         "",

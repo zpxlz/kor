@@ -13,11 +13,12 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 func createTestConfigmaps(t *testing.T) *fake.Clientset {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{Name: testNamespace},
@@ -57,10 +58,16 @@ func createTestConfigmaps(t *testing.T) *fake.Clientset {
 		t.Fatalf("Error creating fake configmap: %v", err)
 	}
 
+	configmap6 := CreateTestConfigmap(testNamespace, "configmap-6", AppLabels)
+	_, err = clientset.CoreV1().ConfigMaps(testNamespace).Create(context.TODO(), configmap6, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake configmap: %v", err)
+	}
+
 	pod1 := CreateTestPod(testNamespace, "pod-1", "", []corev1.Volume{
 		{
 			Name:         "vol-1",
-			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configmap1.ObjectMeta.Name}}},
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: configmap1.Name}}},
 		},
 	}, AppLabels)
 
@@ -70,7 +77,7 @@ func createTestConfigmaps(t *testing.T) *fake.Clientset {
 			Env: []corev1.EnvVar{
 				{
 					Name:      "ENV_VAR_1",
-					ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: configmap1.ObjectMeta.Name}}},
+					ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: configmap1.Name}}},
 				},
 			},
 		},
@@ -80,7 +87,7 @@ func createTestConfigmaps(t *testing.T) *fake.Clientset {
 	pod3.Spec.Containers = []corev1.Container{
 		{
 			EnvFrom: []corev1.EnvFromSource{
-				{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: configmap2.ObjectMeta.Name}}},
+				{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: configmap2.Name}}},
 			},
 		},
 	}
@@ -91,7 +98,18 @@ func createTestConfigmaps(t *testing.T) *fake.Clientset {
 			Env: []corev1.EnvVar{
 				{
 					Name:      "INIT_ENV_VAR_1",
-					ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: configmap2.ObjectMeta.Name}}},
+					ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: configmap2.Name}}},
+				},
+			},
+		},
+	}
+
+	pod5 := CreateTestPod(testNamespace, "pod-5", "", nil, AppLabels)
+	pod5.Spec.InitContainers = []corev1.Container{
+		{
+			EnvFrom: []corev1.EnvFromSource{
+				{
+					ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: configmap6.Name}},
 				},
 			},
 		},
@@ -117,6 +135,11 @@ func createTestConfigmaps(t *testing.T) *fake.Clientset {
 		t.Fatalf("Error creating fake pod: %v", err)
 	}
 
+	_, err = clientset.CoreV1().Pods(testNamespace).Create(context.TODO(), pod5, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake pod: %v", err)
+	}
+
 	return clientset
 }
 
@@ -133,6 +156,7 @@ func TestRetrieveConfigMapNames(t *testing.T) {
 		"configmap-1",
 		"configmap-2",
 		"configmap-3",
+		"configmap-6",
 	}
 	if !equalSlices(configMapNames, expectedConfigMapNames) {
 		t.Errorf("Expected configmap names %v, got %v", expectedConfigMapNames, configMapNames)
@@ -142,16 +166,16 @@ func TestRetrieveConfigMapNames(t *testing.T) {
 func TestProcessNamespaceCM(t *testing.T) {
 	clientset := createTestConfigmaps(t)
 
-	diff, err := processNamespaceCM(clientset, testNamespace, &filters.Options{})
+	diff, err := processNamespaceCM(clientset, testNamespace, &filters.Options{}, common.Opts{})
 	if err != nil {
 		t.Fatalf("Error processing namespace CM: %v", err)
 	}
 
-	unusedConfigmaps := []string{
-		"configmap-3",
-		"configmap-5",
+	unusedConfigmaps := []ResourceInfo{
+		{Name: "configmap-3", Reason: "ConfigMap is not used in any pod or container"},
+		{Name: "configmap-5", Reason: "Marked with unused label"},
 	}
-	if !equalSlices(diff, unusedConfigmaps) {
+	if !equalResourceInfoSlices(diff, unusedConfigmaps) {
 		t.Errorf("Expected diff %v, got %v", unusedConfigmaps, diff)
 	}
 }
@@ -167,7 +191,6 @@ func TestRetrieveUsedCM(t *testing.T) {
 
 	expectedVolumesCM := []string{
 		"configmap-1",
-		"kube-root-ca.crt",
 	}
 	if !equalSlices(volumesCM, expectedVolumesCM) {
 		t.Errorf("Expected volume configmaps %v, got %v", expectedVolumesCM, volumesCM)
@@ -188,17 +211,16 @@ func TestRetrieveUsedCM(t *testing.T) {
 		t.Errorf("Expected envFrom configmaps %v, got %v", expectedEnvFromContainerCM, envFromContainerCM)
 	}
 
-	expectedEnvFromInitContainerCM := []string{"configmap-2"}
+	expectedEnvFromInitContainerCM := []string{"configmap-2", "configmap-6"}
 	if !equalSlices(envFromInitContainerCM, expectedEnvFromInitContainerCM) {
 		t.Errorf("Expected initContainer env configmaps %v, got %v", expectedEnvFromInitContainerCM, envFromInitContainerCM)
 	}
-
 }
 
 func TestGetUnusedConfigmapsStructured(t *testing.T) {
 	clientset := createTestConfigmaps(t)
 
-	opts := Opts{
+	opts := common.Opts{
 		WebhookURL:    "",
 		Channel:       "",
 		Token:         "",
@@ -228,6 +250,68 @@ func TestGetUnusedConfigmapsStructured(t *testing.T) {
 
 	if !reflect.DeepEqual(expectedOutput, actualOutput) {
 		t.Errorf("Expected output does not match actual output")
+	}
+}
+
+func TestFilterOwnerReferencedConfigMaps(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: testNamespace},
+	}, metav1.CreateOptions{})
+
+	if err != nil {
+		t.Fatalf("Error creating namespace %s: %v", testNamespace, err)
+	}
+
+	// Create two configmaps - one owned by deployment, one standalone
+	// ConfigMap owned by deployment
+	ownedConfigMap := CreateTestConfigmap(testNamespace, "owned-configmap", AppLabels)
+	// Add owner reference to deployment
+	ownedConfigMap.OwnerReferences = []metav1.OwnerReference{
+		{
+			Kind: "Deployment",
+			Name: "test-deployment",
+		},
+	}
+
+	// Standalone ConfigMap
+	standaloneConfigMap := CreateTestConfigmap(testNamespace, "standalone-configmap", AppLabels)
+
+	_, err = clientset.CoreV1().ConfigMaps(testNamespace).Create(context.TODO(), ownedConfigMap, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake configmap: %v", err)
+	}
+
+	_, err = clientset.CoreV1().ConfigMaps(testNamespace).Create(context.TODO(), standaloneConfigMap, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake configmap: %v", err)
+	}
+
+	// Test without filter - should return both
+	filterOptsNoSkip := &filters.Options{IgnoreOwnerReferences: false}
+	unusedWithoutFilter, err := processNamespaceCM(clientset, testNamespace, filterOptsNoSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused configmaps: %v", err)
+	}
+
+	if len(unusedWithoutFilter) != 2 {
+		t.Errorf("Expected 2 unused ConfigMap objects without filter, got %d", len(unusedWithoutFilter))
+	}
+
+	// Test with filter - should return only standalone
+	filterOptsWithSkip := &filters.Options{IgnoreOwnerReferences: true}
+	unusedWithFilter, err := processNamespaceCM(clientset, testNamespace, filterOptsWithSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused configmaps: %v", err)
+	}
+
+	if len(unusedWithFilter) != 1 {
+		t.Errorf("Expected 1 unused ConfigMap object with filter, got %d", len(unusedWithFilter))
+	}
+
+	if unusedWithFilter[0].Name != "standalone-configmap" {
+		t.Errorf("Expected standalone-configmap to be unused, got %s", unusedWithFilter[0].Name)
 	}
 }
 

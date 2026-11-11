@@ -1,15 +1,20 @@
 package kor
 
 import (
+	"encoding/json"
+	"slices"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	fakedynamic "k8s.io/client-go/dynamic/fake"
-	"k8s.io/utils/strings/slices"
+	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/rest"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
@@ -92,10 +97,54 @@ func TestRetrievePendingDeletionResources(t *testing.T) {
 				t.Errorf("Expected error: %v, Got: %v", test.expectedError, err)
 			}
 			if deletedResources, ok := result[testNamespace][gvr.GroupVersion().WithResource("testresources")]; ok {
-				if !slices.Equal(deletedResources, test.expectedResult) {
+				deletedResourceNames := extractNames(deletedResources)
+				if !slices.Equal(deletedResourceNames, test.expectedResult) {
 					t.Errorf("Expected result: %v, Got: %v", test.expectedResult, deletedResources)
 				}
 			}
 		})
+	}
+}
+
+func extractNames(resources []ResourceInfo) []string {
+	names := make([]string, len(resources))
+	for i, resource := range resources {
+		names[i] = resource.Name
+	}
+	return names
+}
+
+func TestGetResourcesWithFinalizersPendingDeletion(t *testing.T) {
+	clientset := fake.NewClientset()
+	dynamicClient := fakedynamic.NewSimpleDynamicClient(runtime.NewScheme())
+
+	result, err := getResourcesWithFinalizersPendingDeletion(clientset, dynamicClient, &filters.Options{})
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+	if len(result) != 0 {
+		t.Errorf("Expected no pending deletion resources, got %v", result)
+	}
+}
+
+func TestGetUnusedfinalizers(t *testing.T) {
+	clientset := fake.NewClientset()
+	dynamicClient, err := dynamic.NewForConfig(&rest.Config{Host: "http://localhost:1"})
+	if err != nil {
+		t.Fatalf("Error creating dynamic client: %v", err)
+	}
+
+	opts := common.Opts{GroupBy: "namespace"}
+	output, err := GetUnusedfinalizers(&filters.Options{}, clientset, dynamicClient, "json", opts)
+	if err != nil {
+		t.Fatalf("Expected no error, got %v", err)
+	}
+
+	var actual map[string]map[string][]ResourceInfo
+	if err := json.Unmarshal([]byte(output), &actual); err != nil {
+		t.Fatalf("Error unmarshaling output: %v", err)
+	}
+	if len(actual) != 0 {
+		t.Errorf("Expected no pending deletion resources, got %v", actual)
 	}
 }

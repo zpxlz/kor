@@ -11,6 +11,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
@@ -27,12 +28,17 @@ func retrieveUsedPvcs(clientset kubernetes.Interface, namespace string) ([]strin
 			if volume.PersistentVolumeClaim != nil {
 				usedPvcs = append(usedPvcs, volume.PersistentVolumeClaim.ClaimName)
 			}
+			// Include ephemeral PVC
+			if volume.Ephemeral != nil && volume.Ephemeral.VolumeClaimTemplate != nil {
+				// https://kubernetes.io/docs/concepts/storage/ephemeral-volumes/#persistentvolumeclaim-naming
+				usedPvcs = append(usedPvcs, pod.GetObjectMeta().GetName()+"-"+volume.Name)
+			}
 		}
 	}
 	return usedPvcs, err
 }
 
-func processNamespacePvcs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]string, error) {
+func processNamespacePvcs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ([]ResourceInfo, error) {
 	pvcs, err := clientset.CoreV1().PersistentVolumeClaims(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: filterOpts.IncludeLabels})
 	if err != nil {
 		return nil, err
@@ -41,7 +47,12 @@ func processNamespacePvcs(clientset kubernetes.Interface, namespace string, filt
 	var unusedPvcNames []string
 	pvcNames := make([]string, 0, len(pvcs.Items))
 	for _, pvc := range pvcs.Items {
-		if pass := filters.KorLabelFilter(&pvc, &filters.Options{}); pass {
+		// Skip resources with ownerReferences if the general flag is set
+		if filterOpts.IgnoreOwnerReferences && len(pvc.OwnerReferences) > 0 {
+			continue
+		}
+
+		if pass, _ := filter.SetObject(&pvc).Run(filterOpts); pass {
 			continue
 		}
 
@@ -58,30 +69,39 @@ func processNamespacePvcs(clientset kubernetes.Interface, namespace string, filt
 		return nil, err
 	}
 
-	diff := CalculateResourceDifference(usedPvcs, pvcNames)
-	diff = append(diff, unusedPvcNames...)
+	var diff []ResourceInfo
+	for _, name := range CalculateResourceDifference(usedPvcs, pvcNames) {
+		reason := "PVC is not in use"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+
+	for _, name := range unusedPvcNames {
+		reason := "Marked with unused label"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+
+	if opts.DeleteFlag {
+		if diff, err = DeleteResource(diff, clientset, namespace, "PVC", opts.NoInteractive); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to delete PVC %s in namespace %s: %v\n", diff, namespace, err)
+		}
+	}
 	return diff, nil
 }
 
-func GetUnusedPvcs(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+func GetUnusedPvcs(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
 	for _, namespace := range filterOpts.Namespaces(clientset) {
-		diff, err := processNamespacePvcs(clientset, namespace, filterOpts)
+		diff, err := processNamespacePvcs(clientset, namespace, filterOpts, opts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to process namespace %s: %v\n", namespace, err)
 			continue
 		}
 		switch opts.GroupBy {
 		case "namespace":
-			resources[namespace] = make(map[string][]string)
+			resources[namespace] = make(map[string][]ResourceInfo)
 			resources[namespace]["Pvc"] = diff
 		case "resource":
 			appendResources(resources, "Pvc", namespace, diff)
-		}
-		if opts.DeleteFlag {
-			if diff, err = DeleteResource(diff, clientset, namespace, "PVC", opts.NoInteractive); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to delete PVC %s in namespace %s: %v\n", diff, namespace, err)
-			}
 		}
 	}
 

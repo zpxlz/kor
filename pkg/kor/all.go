@@ -10,8 +10,12 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
+	"github.com/yonahd/kor/pkg/utils"
 )
+
+var NamespacedFlagUsed bool
 
 type GetUnusedResourceJSONResponse struct {
 	ResourceType string              `json:"resourceType"`
@@ -20,11 +24,15 @@ type GetUnusedResourceJSONResponse struct {
 
 type ResourceDiff struct {
 	resourceType string
-	diff         []string
+	diff         []ResourceInfo
 }
 
-func getUnusedCMs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	cmDiff, err := processNamespaceCM(clientset, namespace, filterOpts)
+func resourceDiffJobPanicHandler(recovered any) {
+	fmt.Fprintf(os.Stderr, "Failed to process resource diff job: %v\n", recovered)
+}
+
+func getUnusedCMs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	cmDiff, err := processNamespaceCM(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "configmaps", namespace, err)
 	}
@@ -35,8 +43,8 @@ func getUnusedCMs(clientset kubernetes.Interface, namespace string, filterOpts *
 	return namespaceCMDiff
 }
 
-func getUnusedSVCs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	svcDiff, err := processNamespaceServices(clientset, namespace, filterOpts)
+func getUnusedSVCs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	svcDiff, err := processNamespaceServices(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "services", namespace, err)
 	}
@@ -47,8 +55,8 @@ func getUnusedSVCs(clientset kubernetes.Interface, namespace string, filterOpts 
 	return namespaceSVCDiff
 }
 
-func getUnusedSecrets(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	secretDiff, err := processNamespaceSecret(clientset, namespace, filterOpts)
+func getUnusedSecrets(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	secretDiff, err := processNamespaceSecret(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "secrets", namespace, err)
 	}
@@ -59,8 +67,8 @@ func getUnusedSecrets(clientset kubernetes.Interface, namespace string, filterOp
 	return namespaceSecretDiff
 }
 
-func getUnusedServiceAccounts(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	saDiff, err := processNamespaceSA(clientset, namespace, filterOpts)
+func getUnusedServiceAccounts(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	saDiff, err := processNamespaceSA(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "serviceaccounts", namespace, err)
 	}
@@ -71,8 +79,8 @@ func getUnusedServiceAccounts(clientset kubernetes.Interface, namespace string, 
 	return namespaceSADiff
 }
 
-func getUnusedDeployments(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	deployDiff, err := processNamespaceDeployments(clientset, namespace, filterOpts)
+func getUnusedDeployments(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	deployDiff, err := processNamespaceDeployments(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "deployments", namespace, err)
 	}
@@ -83,8 +91,8 @@ func getUnusedDeployments(clientset kubernetes.Interface, namespace string, filt
 	return namespaceSADiff
 }
 
-func getUnusedStatefulSets(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	stsDiff, err := processNamespaceStatefulSets(clientset, namespace, filterOpts)
+func getUnusedStatefulSets(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	stsDiff, err := processNamespaceStatefulSets(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "statefulSets", namespace, err)
 	}
@@ -95,8 +103,8 @@ func getUnusedStatefulSets(clientset kubernetes.Interface, namespace string, fil
 	return namespaceSADiff
 }
 
-func getUnusedRoles(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	roleDiff, err := processNamespaceRoles(clientset, namespace, filterOpts)
+func getUnusedRoles(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	roleDiff, err := processNamespaceRoles(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "roles", namespace, err)
 	}
@@ -119,8 +127,20 @@ func getUnusedClusterRoles(clientset kubernetes.Interface, filterOpts *filters.O
 	return aDiff
 }
 
-func getUnusedHpas(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	hpaDiff, err := processNamespaceHpas(clientset, namespace, filterOpts)
+func getUnusedClusterRoleBindings(clientset kubernetes.Interface, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	clusterRoleBindingDiff, err := processClusterRoleBindings(clientset, filterOpts, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get %s: %v\n", "clusterRoleBindings", err)
+	}
+	aDiff := ResourceDiff{
+		"ClusterRoleBinding",
+		clusterRoleBindingDiff,
+	}
+	return aDiff
+}
+
+func getUnusedHpas(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	hpaDiff, err := processNamespaceHpas(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "hpas", namespace, err)
 	}
@@ -131,8 +151,8 @@ func getUnusedHpas(clientset kubernetes.Interface, namespace string, filterOpts 
 	return namespaceHpaDiff
 }
 
-func getUnusedPvcs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	pvcDiff, err := processNamespacePvcs(clientset, namespace, filterOpts)
+func getUnusedPvcs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	pvcDiff, err := processNamespacePvcs(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "pvcs", namespace, err)
 	}
@@ -143,8 +163,8 @@ func getUnusedPvcs(clientset kubernetes.Interface, namespace string, filterOpts 
 	return namespacePvcDiff
 }
 
-func getUnusedIngresses(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	ingressDiff, err := processNamespaceIngresses(clientset, namespace, filterOpts)
+func getUnusedIngresses(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	ingressDiff, err := processNamespaceIngresses(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "ingresses", namespace, err)
 	}
@@ -155,8 +175,8 @@ func getUnusedIngresses(clientset kubernetes.Interface, namespace string, filter
 	return namespaceIngressDiff
 }
 
-func getUnusedPdbs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	pdbDiff, err := processNamespacePdbs(clientset, namespace, filterOpts)
+func getUnusedPdbs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	pdbDiff, err := processNamespacePdbs(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "pdbs", namespace, err)
 	}
@@ -191,8 +211,8 @@ func getUnusedPvs(clientset kubernetes.Interface, filterOpts *filters.Options) R
 	return allPvDiff
 }
 
-func getUnusedPods(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	podDiff, err := processNamespacePods(clientset, namespace, filterOpts)
+func getUnusedPods(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	podDiff, err := processNamespacePods(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "pods", namespace, err)
 	}
@@ -203,8 +223,8 @@ func getUnusedPods(clientset kubernetes.Interface, namespace string, filterOpts 
 	return namespacePodDiff
 }
 
-func getUnusedJobs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	jobDiff, err := processNamespaceJobs(clientset, namespace, filterOpts)
+func getUnusedJobs(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	jobDiff, err := processNamespaceJobs(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "jobs", namespace, err)
 	}
@@ -215,10 +235,10 @@ func getUnusedJobs(clientset kubernetes.Interface, namespace string, filterOpts 
 	return namespaceJobDiff
 }
 
-func getUnusedReplicaSets(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	replicaSetDiff, err := processNamespaceReplicaSets(clientset, namespace, filterOpts)
+func getUnusedReplicaSets(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	replicaSetDiff, err := processNamespaceReplicaSets(clientset, namespace, filterOpts, opts)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "jobs", namespace, err)
+		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "ReplicaSets", namespace, err)
 	}
 	namespaceRSDiff := ResourceDiff{
 		"ReplicaSet",
@@ -227,8 +247,8 @@ func getUnusedReplicaSets(clientset kubernetes.Interface, namespace string, filt
 	return namespaceRSDiff
 }
 
-func getUnusedDaemonSets(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ResourceDiff {
-	dsDiff, err := processNamespaceDaemonSets(clientset, namespace, filterOpts)
+func getUnusedDaemonSets(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	dsDiff, err := processNamespaceDaemonSets(clientset, namespace, filterOpts, opts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "DaemonSets", namespace, err)
 	}
@@ -250,44 +270,105 @@ func getUnusedStorageClasses(clientset kubernetes.Interface, filterOpts *filters
 	}
 	return allScDiff
 }
+func getUnusedVolumeAttachments(clientset kubernetes.Interface, filterOpts *filters.Options) ResourceDiff {
+	vattsDiff, err := processVolumeAttachments(clientset, filterOpts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get %s: %v\n", "VolumeAttachments", err)
+	}
+	allVattsDiff := ResourceDiff{
+		"VolumeAttachment",
+		vattsDiff,
+	}
+	return allVattsDiff
+}
 
-func GetUnusedAllNamespaced(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
-	for _, namespace := range filterOpts.Namespaces(clientset) {
+func getUnusedPriorityClasses(clientset kubernetes.Interface, filterOpts *filters.Options) ResourceDiff {
+	pcDiff, err := processPriorityClasses(clientset, filterOpts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get %s: %v\n", "PriorityClasses", err)
+	}
+	allPcDiff := ResourceDiff{
+		"PriorityClass",
+		pcDiff,
+	}
+	return allPcDiff
+}
+
+func getUnusedNetworkPolicies(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	netpolDiff, err := processNamespaceNetworkPolicies(clientset, namespace, filterOpts, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "NetworkPolicies", namespace, err)
+	}
+	namespaceNetpolDiff := ResourceDiff{
+		"NetworkPolicy",
+		netpolDiff,
+	}
+	return namespaceNetpolDiff
+}
+
+func getUnusedRoleBindings(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ResourceDiff {
+	roleBindingDiff, err := processNamespaceRoleBindings(clientset, namespace, filterOpts, opts)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get %s namespace %s: %v\n", "RoleBindings", namespace, err)
+	}
+
+	namespaceRoleBindingDiff := ResourceDiff{
+		"RoleBinding",
+		roleBindingDiff,
+	}
+	return namespaceRoleBindingDiff
+}
+
+func GetUnusedAllNamespaced(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
+	maxWorkers := utils.MaxParallelWorkers()
+	namespaces := filterOpts.Namespaces(clientset)
+
+	type namespaceResult struct {
+		namespace string
+		diffs     []ResourceDiff
+	}
+
+	namespaceJobs := make([]func() namespaceResult, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		ns := namespace
+		namespaceJobs = append(namespaceJobs, func() namespaceResult {
+			resourceDiffs := utils.RunJobs([]func() ResourceDiff{
+				func() ResourceDiff { return getUnusedCMs(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedSVCs(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedSecrets(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedServiceAccounts(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedDeployments(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedStatefulSets(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedRoles(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedHpas(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedPvcs(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedPods(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedIngresses(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedPdbs(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedJobs(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedReplicaSets(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedDaemonSets(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedNetworkPolicies(clientset, ns, filterOpts, opts) },
+				func() ResourceDiff { return getUnusedRoleBindings(clientset, ns, filterOpts, opts) },
+			}, maxWorkers, resourceDiffJobPanicHandler)
+
+			return namespaceResult{namespace: ns, diffs: resourceDiffs}
+		})
+	}
+
+	namespaceResults := utils.RunJobs(namespaceJobs, maxWorkers, resourceDiffJobPanicHandler)
+	for _, result := range namespaceResults {
 		switch opts.GroupBy {
 		case "namespace":
-			resources[namespace] = make(map[string][]string)
-			resources[namespace]["ConfigMap"] = getUnusedCMs(clientset, namespace, filterOpts).diff
-			resources[namespace]["Service"] = getUnusedSVCs(clientset, namespace, filterOpts).diff
-			resources[namespace]["Secret"] = getUnusedSecrets(clientset, namespace, filterOpts).diff
-			resources[namespace]["ServiceAccount"] = getUnusedServiceAccounts(clientset, namespace, filterOpts).diff
-			resources[namespace]["Deployment"] = getUnusedDeployments(clientset, namespace, filterOpts).diff
-			resources[namespace]["StatefulSet"] = getUnusedStatefulSets(clientset, namespace, filterOpts).diff
-			resources[namespace]["Role"] = getUnusedRoles(clientset, namespace, filterOpts).diff
-			resources[namespace]["Hpa"] = getUnusedHpas(clientset, namespace, filterOpts).diff
-			resources[namespace]["Pvc"] = getUnusedPvcs(clientset, namespace, filterOpts).diff
-			resources[namespace]["Pod"] = getUnusedPods(clientset, namespace, filterOpts).diff
-			resources[namespace]["Ingress"] = getUnusedIngresses(clientset, namespace, filterOpts).diff
-			resources[namespace]["Pdb"] = getUnusedPdbs(clientset, namespace, filterOpts).diff
-			resources[namespace]["Job"] = getUnusedJobs(clientset, namespace, filterOpts).diff
-			resources[namespace]["ReplicaSet"] = getUnusedReplicaSets(clientset, namespace, filterOpts).diff
-			resources[namespace]["DaemonSet"] = getUnusedDaemonSets(clientset, namespace, filterOpts).diff
+			resources[result.namespace] = make(map[string][]ResourceInfo)
+			for _, diff := range result.diffs {
+				resources[result.namespace][diff.resourceType] = diff.diff
+			}
 		case "resource":
-			appendResources(resources, "ConfigMap", namespace, getUnusedCMs(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Service", namespace, getUnusedSVCs(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Secret", namespace, getUnusedSecrets(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "ServiceAccount", namespace, getUnusedServiceAccounts(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Deployment", namespace, getUnusedDeployments(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "StatefulSet", namespace, getUnusedStatefulSets(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Role", namespace, getUnusedRoles(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Hpa", namespace, getUnusedHpas(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Pvc", namespace, getUnusedPvcs(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Pod", namespace, getUnusedPods(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Ingress", namespace, getUnusedIngresses(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Pdb", namespace, getUnusedPdbs(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "Job", namespace, getUnusedJobs(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "ReplicaSet", namespace, getUnusedReplicaSets(clientset, namespace, filterOpts).diff)
-			appendResources(resources, "DaemonSet", namespace, getUnusedDaemonSets(clientset, namespace, filterOpts).diff)
+			for _, diff := range result.diffs {
+				appendResources(resources, diff.resourceType, result.namespace, diff.diff)
+			}
 		}
 	}
 
@@ -311,20 +392,28 @@ func GetUnusedAllNamespaced(filterOpts *filters.Options, clientset kubernetes.In
 	return unusedAllNamespaced, nil
 }
 
-func GetUnusedAllNonNamespaced(filterOpts *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+func GetUnusedAllNonNamespaced(filterOpts *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
+	resourceDiffs := utils.RunJobs([]func() ResourceDiff{
+		func() ResourceDiff { return getUnusedCrds(apiExtClient, dynamicClient, filterOpts) },
+		func() ResourceDiff { return getUnusedPvs(clientset, filterOpts) },
+		func() ResourceDiff { return getUnusedClusterRoles(clientset, filterOpts) },
+		func() ResourceDiff { return getUnusedClusterRoleBindings(clientset, filterOpts, opts) },
+		func() ResourceDiff { return getUnusedStorageClasses(clientset, filterOpts) },
+		func() ResourceDiff { return getUnusedVolumeAttachments(clientset, filterOpts) },
+		func() ResourceDiff { return getUnusedPriorityClasses(clientset, filterOpts) },
+	}, utils.MaxParallelWorkers(), resourceDiffJobPanicHandler)
 	switch opts.GroupBy {
 	case "namespace":
-		resources[""] = make(map[string][]string)
-		resources[""]["Crd"] = getUnusedCrds(apiExtClient, dynamicClient, filterOpts).diff
-		resources[""]["Pv"] = getUnusedPvs(clientset, filterOpts).diff
-		resources[""]["ClusterRole"] = getUnusedClusterRoles(clientset, filterOpts).diff
-		resources[""]["StorageClass"] = getUnusedStorageClasses(clientset, filterOpts).diff
+		resources[""] = make(map[string][]ResourceInfo)
+		for _, diff := range resourceDiffs {
+			resources[""][diff.resourceType] = diff.diff
+		}
 	case "resource":
-		appendResources(resources, "Crd", "", getUnusedCrds(apiExtClient, dynamicClient, filterOpts).diff)
-		appendResources(resources, "Pv", "", getUnusedPvs(clientset, filterOpts).diff)
-		appendResources(resources, "ClusterRole", "", getUnusedClusterRoles(clientset, filterOpts).diff)
-		appendResources(resources, "StorageClass", "", getUnusedStorageClasses(clientset, filterOpts).diff)
+		for _, diff := range resourceDiffs {
+			appendResources(resources, diff.resourceType, "", diff.diff)
+		}
+
 	}
 
 	var outputBuffer bytes.Buffer
@@ -347,7 +436,14 @@ func GetUnusedAllNonNamespaced(filterOpts *filters.Options, clientset kubernetes
 	return unusedAllNonNamespaced, nil
 }
 
-func GetUnusedAll(filterOpts *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts Opts) (string, error) {
+func GetUnusedAll(filterOpts *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts common.Opts) (string, error) {
+	if NamespacedFlagUsed {
+		if opts.Namespaced {
+			return GetUnusedAllNamespaced(filterOpts, clientset, outputFormat, opts)
+		}
+		return GetUnusedAllNonNamespaced(filterOpts, clientset, apiExtClient, dynamicClient, outputFormat, opts)
+	}
+
 	unusedAllNamespaced, err := GetUnusedAllNamespaced(filterOpts, clientset, outputFormat, opts)
 	if err != nil {
 		fmt.Printf("err: %v\n", err)
@@ -393,4 +489,8 @@ func GetUnusedAll(filterOpts *filters.Options, clientset kubernetes.Interface, a
 
 		return string(jsonResponse), nil
 	}
+}
+
+func SetNamespacedFlagState(isFlagUsed bool) {
+	NamespacedFlagUsed = isFlagUsed
 }

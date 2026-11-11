@@ -12,6 +12,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
@@ -71,17 +72,11 @@ func retrieveUsedCM(clientset kubernetes.Interface, namespace string) ([]string,
 					envFromInitContainerCM = append(envFromInitContainerCM, env.ValueFrom.ConfigMapKeyRef.Name)
 				}
 			}
-		}
-	}
-
-	config, err := unmarshalConfig(configMapsConfig)
-	if err != nil {
-		return nil, nil, nil, nil, nil, err
-	}
-
-	for _, resource := range config.ExceptionConfigMaps {
-		if resource.Namespace == namespace || resource.Namespace == "*" {
-			volumesCM = append(volumesCM, resource.ResourceName)
+			for _, envFrom := range initContainer.EnvFrom {
+				if envFrom.ConfigMapRef != nil {
+					envFromInitContainerCM = append(envFromInitContainerCM, envFrom.ConfigMapRef.Name)
+				}
+			}
 		}
 	}
 
@@ -98,6 +93,11 @@ func retrieveConfigMapNames(clientset kubernetes.Interface, namespace string, fi
 	names := make([]string, 0, len(configmaps.Items))
 
 	for _, configmap := range configmaps.Items {
+		// Skip resources with ownerReferences if the general flag is set
+		if filterOpts.IgnoreOwnerReferences && len(configmap.OwnerReferences) > 0 {
+			continue
+		}
+
 		if pass, _ := filter.SetObject(&configmap).Run(filterOpts); pass {
 			continue
 		}
@@ -112,8 +112,12 @@ func retrieveConfigMapNames(clientset kubernetes.Interface, namespace string, fi
 	return names, unusedConfigmapNames, nil
 }
 
-func processNamespaceCM(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]string, error) {
+func processNamespaceCM(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ([]ResourceInfo, error) {
 	volumesCM, envCM, envFromCM, envFromContainerCM, envFromInitContainerCM, err := retrieveUsedCM(clientset, namespace)
+	if err != nil {
+		return nil, err
+	}
+	config, err := unmarshalConfig(configMapsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -142,32 +146,49 @@ func processNamespaceCM(clientset kubernetes.Interface, namespace string, filter
 		usedConfigMaps = append(usedConfigMaps, slice...)
 	}
 
-	diff := CalculateResourceDifference(usedConfigMaps, configMapNames)
-	diff = append(diff, unusedConfigmapNames...)
+	var diff []ResourceInfo
+
+	for _, name := range CalculateResourceDifference(usedConfigMaps, configMapNames) {
+		exceptionFound, err := isResourceException(name, namespace, config.ExceptionConfigMaps)
+		if err != nil {
+			return nil, err
+		}
+
+		if exceptionFound {
+			continue
+		}
+		reason := "ConfigMap is not used in any pod or container"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+
+	for _, name := range unusedConfigmapNames {
+		reason := "Marked with unused label"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+
+	if opts.DeleteFlag {
+		if diff, err = DeleteResource(diff, clientset, namespace, "ConfigMap", opts.NoInteractive); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to delete ConfigMap %s in namespace %s: %v\n", diff, namespace, err)
+		}
+	}
 
 	return diff, nil
-
 }
 
-func GetUnusedConfigmaps(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+func GetUnusedConfigmaps(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
 	for _, namespace := range filterOpts.Namespaces(clientset) {
-		diff, err := processNamespaceCM(clientset, namespace, filterOpts)
+		diff, err := processNamespaceCM(clientset, namespace, filterOpts, opts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to process namespace %s: %v\n", namespace, err)
 			continue
 		}
 		switch opts.GroupBy {
 		case "namespace":
-			resources[namespace] = make(map[string][]string)
+			resources[namespace] = make(map[string][]ResourceInfo)
 			resources[namespace]["ConfigMap"] = diff
 		case "resource":
 			appendResources(resources, "ConfigMap", namespace, diff)
-		}
-		if opts.DeleteFlag {
-			if diff, err = DeleteResource(diff, clientset, namespace, "ConfigMap", opts.NoInteractive); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to delete ConfigMap %s in namespace %s: %v\n", diff, namespace, err)
-			}
 		}
 	}
 

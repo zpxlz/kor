@@ -11,34 +11,91 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
+	"github.com/yonahd/kor/pkg/utils"
 )
 
-func retrieveNoNamespaceDiff(clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, resourceList []string, filterOpts *filters.Options) ([]ResourceDiff, []string) {
-	var noNamespaceDiff []ResourceDiff
+func retrieveResourceDiffs(resourceList []string, diffRetriever func(resource string) ResourceDiff) []ResourceDiff {
+	resourceJobs := make([]func() ResourceDiff, 0, len(resourceList))
+	for _, resource := range resourceList {
+		resourceName := resource
+		resourceJobs = append(resourceJobs, func() ResourceDiff {
+			return diffRetriever(resourceName)
+		})
+	}
+
+	return utils.RunJobs(resourceJobs, utils.MaxParallelWorkers(), resourceDiffJobPanicHandler)
+}
+
+func getCanonicalResourceType(resourceName string) string {
+	resourceName = strings.ToLower(resourceName)
+
+	if _, exists := ResourceKindList[resourceName]; exists {
+		return resourceName
+	}
+
+	for singular, resourceKind := range ResourceKindList {
+		if resourceKind.Plural == resourceName {
+			return singular
+		}
+		for _, shortName := range resourceKind.ShortNames {
+			if shortName == resourceName {
+				return singular
+			}
+		}
+	}
+
+	return resourceName
+}
+
+func retrieveNoNamespaceDiff(clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, resourceList []string, filterOpts *filters.Options, opts common.Opts) ([]ResourceDiff, []string) {
+	var noNamespaceJobs []func() ResourceDiff
 	markedForRemoval := make([]bool, len(resourceList))
 	updatedResourceList := resourceList
 
 	for counter, resource := range resourceList {
-		switch resource {
-		case "crd", "customresourcedefinition", "customresourcedefinitions":
-			crdDiff := getUnusedCrds(apiExtClient, dynamicClient, filterOpts)
-			noNamespaceDiff = append(noNamespaceDiff, crdDiff)
+		canonicalType := getCanonicalResourceType(resource)
+		switch canonicalType {
+		case "customresourcedefinition":
+			noNamespaceJobs = append(noNamespaceJobs, func() ResourceDiff {
+				return getUnusedCrds(apiExtClient, dynamicClient, filterOpts)
+			})
 			markedForRemoval[counter] = true
-		case "pv", "persistentvolume", "persistentvolumes":
-			pvDiff := getUnusedPvs(clientset, filterOpts)
-			noNamespaceDiff = append(noNamespaceDiff, pvDiff)
+		case "persistentvolume":
+			noNamespaceJobs = append(noNamespaceJobs, func() ResourceDiff {
+				return getUnusedPvs(clientset, filterOpts)
+			})
 			markedForRemoval[counter] = true
-		case "clusterrole", "clusterroles":
-			clusterRoleDiff := getUnusedClusterRoles(clientset, filterOpts)
-			noNamespaceDiff = append(noNamespaceDiff, clusterRoleDiff)
+		case "clusterrole":
+			noNamespaceJobs = append(noNamespaceJobs, func() ResourceDiff {
+				return getUnusedClusterRoles(clientset, filterOpts)
+			})
 			markedForRemoval[counter] = true
-		case "sc", "storageclass", "storageclasses":
-			storageClassDiff := getUnusedStorageClasses(clientset, filterOpts)
-			noNamespaceDiff = append(noNamespaceDiff, storageClassDiff)
+		case "clusterrolebinding":
+			noNamespaceJobs = append(noNamespaceJobs, func() ResourceDiff {
+				return getUnusedClusterRoleBindings(clientset, filterOpts, opts)
+			})
+			markedForRemoval[counter] = true
+		case "storageclass":
+			noNamespaceJobs = append(noNamespaceJobs, func() ResourceDiff {
+				return getUnusedStorageClasses(clientset, filterOpts)
+			})
+			markedForRemoval[counter] = true
+		case "volumeattachment":
+			noNamespaceJobs = append(noNamespaceJobs, func() ResourceDiff {
+				return getUnusedVolumeAttachments(clientset, filterOpts)
+			})
+			markedForRemoval[counter] = true
+		case "priorityclass":
+			noNamespaceJobs = append(noNamespaceJobs, func() ResourceDiff {
+				return getUnusedPriorityClasses(clientset, filterOpts)
+			})
 			markedForRemoval[counter] = true
 		}
 	}
+
+	noNamespaceDiff := utils.RunJobs(noNamespaceJobs, utils.MaxParallelWorkers(), resourceDiffJobPanicHandler)
 
 	// Remove elements marked for removal
 	var clearedResourceList []string
@@ -51,108 +108,129 @@ func retrieveNoNamespaceDiff(clientset kubernetes.Interface, apiExtClient apiext
 	return noNamespaceDiff, clearedResourceList
 }
 
-func retrieveNamespaceDiffs(clientset kubernetes.Interface, namespace string, resourceList []string, filterOpts *filters.Options) []ResourceDiff {
-	var allDiffs []ResourceDiff
-	for _, resource := range resourceList {
-		var diffResult ResourceDiff
-		switch resource {
-		case "cm", "configmap", "configmaps":
-			diffResult = getUnusedCMs(clientset, namespace, filterOpts)
-		case "svc", "service", "services":
-			diffResult = getUnusedSVCs(clientset, namespace, filterOpts)
-		case "scrt", "secret", "secrets":
-			diffResult = getUnusedSecrets(clientset, namespace, filterOpts)
-		case "sa", "serviceaccount", "serviceaccounts":
-			diffResult = getUnusedServiceAccounts(clientset, namespace, filterOpts)
-		case "deploy", "deployment", "deployments":
-			diffResult = getUnusedDeployments(clientset, namespace, filterOpts)
-		case "sts", "statefulset", "statefulsets":
-			diffResult = getUnusedStatefulSets(clientset, namespace, filterOpts)
-		case "role", "roles":
-			diffResult = getUnusedRoles(clientset, namespace, filterOpts)
-		case "hpa", "horizontalpodautoscaler", "horizontalpodautoscalers":
-			diffResult = getUnusedHpas(clientset, namespace, filterOpts)
-		case "pvc", "persistentvolumeclaim", "persistentvolumeclaims":
-			diffResult = getUnusedPvcs(clientset, namespace, filterOpts)
-		case "ing", "ingress", "ingresses":
-			diffResult = getUnusedIngresses(clientset, namespace, filterOpts)
-		case "pdb", "poddisruptionbudget", "poddisruptionbudgets":
-			diffResult = getUnusedPdbs(clientset, namespace, filterOpts)
-		case "po", "pod", "pods":
-			diffResult = getUnusedPods(clientset, namespace, filterOpts)
-		case "job", "jobs":
-			diffResult = getUnusedJobs(clientset, namespace, filterOpts)
-		case "rs", "replicaset", "replicasets":
-			diffResult = getUnusedReplicaSets(clientset, namespace, filterOpts)
-		case "ds", "daemonset", "daemonsets":
-			diffResult = getUnusedDaemonSets(clientset, namespace, filterOpts)
+func retrieveNamespaceDiffs(clientset kubernetes.Interface, namespace string, resourceList []string, filterOpts *filters.Options, opts common.Opts) []ResourceDiff {
+	return retrieveResourceDiffs(resourceList, func(resource string) ResourceDiff {
+		canonicalType := getCanonicalResourceType(resource)
+		switch canonicalType {
+		case "configmap":
+			return getUnusedCMs(clientset, namespace, filterOpts, opts)
+		case "service":
+			return getUnusedSVCs(clientset, namespace, filterOpts, opts)
+		case "secret":
+			return getUnusedSecrets(clientset, namespace, filterOpts, opts)
+		case "serviceaccount":
+			return getUnusedServiceAccounts(clientset, namespace, filterOpts, opts)
+		case "deployment":
+			return getUnusedDeployments(clientset, namespace, filterOpts, opts)
+		case "statefulset":
+			return getUnusedStatefulSets(clientset, namespace, filterOpts, opts)
+		case "role":
+			return getUnusedRoles(clientset, namespace, filterOpts, opts)
+		case "horizontalpodautoscaler":
+			return getUnusedHpas(clientset, namespace, filterOpts, opts)
+		case "persistentvolumeclaim":
+			return getUnusedPvcs(clientset, namespace, filterOpts, opts)
+		case "ingress":
+			return getUnusedIngresses(clientset, namespace, filterOpts, opts)
+		case "poddisruptionbudget":
+			return getUnusedPdbs(clientset, namespace, filterOpts, opts)
+		case "pod":
+			return getUnusedPods(clientset, namespace, filterOpts, opts)
+		case "job":
+			return getUnusedJobs(clientset, namespace, filterOpts, opts)
+		case "replicaset":
+			return getUnusedReplicaSets(clientset, namespace, filterOpts, opts)
+		case "daemonset":
+			return getUnusedDaemonSets(clientset, namespace, filterOpts, opts)
+		case "networkpolicy":
+			return getUnusedNetworkPolicies(clientset, namespace, filterOpts, opts)
+		case "rolebinding":
+			return getUnusedRoleBindings(clientset, namespace, filterOpts, opts)
 		default:
 			fmt.Printf("resource type %q is not supported\n", resource)
+			return ResourceDiff{}
 		}
-		allDiffs = append(allDiffs, diffResult)
-	}
-	return allDiffs
+	})
 }
 
-func GetUnusedMulti(resourceNames string, filterOpts *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts Opts) (string, error) {
-	var allDiffs []ResourceDiff
-	var outputBuffer bytes.Buffer
-	var unusedMulti string
+func GetUnusedMulti(resourceNames string, filterOpts *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts common.Opts) (string, error) {
 	resourceList := strings.Split(resourceNames, ",")
 	namespaces := filterOpts.Namespaces(clientset)
-	response := make(map[string]map[string][]string)
+	resources := make(map[string]map[string][]ResourceInfo)
 	var err error
 
-	noNamespaceDiff, resourceList := retrieveNoNamespaceDiff(clientset, apiExtClient, dynamicClient, resourceList, filterOpts)
+	if opts.GroupBy == "namespace" {
+		resources[""] = make(map[string][]ResourceInfo)
+	}
+
+	noNamespaceDiff, resourceList := retrieveNoNamespaceDiff(clientset, apiExtClient, dynamicClient, resourceList, filterOpts, opts)
 	if len(noNamespaceDiff) != 0 {
 		for _, diff := range noNamespaceDiff {
 			if len(diff.diff) != 0 {
-				output := FormatOutputAll("", []ResourceDiff{diff}, opts)
-				outputBuffer.WriteString(output)
-
-				resourceMap := make(map[string][]string)
-				resourceMap[diff.resourceType] = diff.diff
-				response[""] = resourceMap
-			}
-		}
-
-		resourceMap := make(map[string][]string)
-		for _, diff := range noNamespaceDiff {
-			resourceMap[diff.resourceType] = diff.diff
-		}
-		response[""] = resourceMap
-
-	}
-
-	for _, namespace := range namespaces {
-		allDiffs = retrieveNamespaceDiffs(clientset, namespace, resourceList, filterOpts)
-
-		if opts.DeleteFlag {
-			for _, diff := range allDiffs {
-				if diff.diff, err = DeleteResource(diff.diff, clientset, namespace, diff.resourceType, opts.NoInteractive); err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to delete %s %s in namespace %s: %v\n", diff.resourceType, diff.diff, namespace, err)
+				if opts.DeleteFlag {
+					if diff.diff, err = DeleteResource(diff.diff, clientset, "", diff.resourceType, opts.NoInteractive); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to delete %s %s: %v\n", diff.resourceType, diff.diff, err)
+					}
+				}
+				switch opts.GroupBy {
+				case "namespace":
+					resources[""][diff.resourceType] = diff.diff
+				case "resource":
+					appendResources(resources, diff.resourceType, "", diff.diff)
 				}
 			}
-
 		}
-		output := FormatOutputAll(namespace, allDiffs, opts)
-		if output != "" {
-			outputBuffer.WriteString(output)
+	}
 
-			resourceMap := make(map[string][]string)
-			for _, diff := range allDiffs {
-				resourceMap[diff.resourceType] = diff.diff
+	type namespaceResult struct {
+		namespace string
+		diffs     []ResourceDiff
+	}
+
+	namespaceJobs := make([]func() namespaceResult, 0, len(namespaces))
+	for _, namespace := range namespaces {
+		ns := namespace
+		namespaceJobs = append(namespaceJobs, func() namespaceResult {
+			return namespaceResult{
+				namespace: ns,
+				diffs:     retrieveNamespaceDiffs(clientset, ns, resourceList, filterOpts, opts),
 			}
-			response[namespace] = resourceMap
+		})
+	}
+
+	for _, result := range utils.RunJobs(namespaceJobs, utils.MaxParallelWorkers(), resourceDiffJobPanicHandler) {
+		if opts.GroupBy == "namespace" {
+			resources[result.namespace] = make(map[string][]ResourceInfo)
+		}
+
+		for _, diff := range result.diffs {
+			if opts.DeleteFlag {
+				if diff.diff, err = DeleteResource(diff.diff, clientset, result.namespace, diff.resourceType, opts.NoInteractive); err != nil {
+					fmt.Fprintf(os.Stderr, "Failed to delete %s %s in namespace %s: %v\n", diff.resourceType, diff.diff, result.namespace, err)
+				}
+			}
+			switch opts.GroupBy {
+			case "namespace":
+				resources[result.namespace][diff.resourceType] = diff.diff
+			case "resource":
+				appendResources(resources, diff.resourceType, result.namespace, diff.diff)
+			}
 		}
 	}
 
-	jsonResponse, err := json.MarshalIndent(response, "", "  ")
-	if err != nil {
-		return "", err
+	var outputBuffer bytes.Buffer
+	var jsonResponse []byte
+	switch outputFormat {
+	case "table":
+		outputBuffer = FormatOutput(resources, opts)
+	case "json", "yaml":
+		var err error
+		if jsonResponse, err = json.MarshalIndent(resources, "", "  "); err != nil {
+			return "", err
+		}
 	}
 
-	unusedMulti, err = unusedResourceFormatter(outputFormat, outputBuffer, opts, jsonResponse)
+	unusedMulti, err := unusedResourceFormatter(outputFormat, outputBuffer, opts, jsonResponse)
 	if err != nil {
 		fmt.Printf("err: %v\n", err)
 	}

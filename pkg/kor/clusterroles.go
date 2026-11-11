@@ -7,14 +7,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
+	"slices"
 
 	v1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
-	"k8s.io/utils/strings/slices"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
@@ -44,9 +44,6 @@ func retrieveUsedClusterRoles(clientset kubernetes.Interface, filterOpts *filter
 	usedClusterRoles := make(map[string]bool)
 
 	for _, rb := range roleBindingsAllNameSpaces {
-		if pass, _ := filter.Run(filterOpts); pass {
-			continue
-		}
 		usedClusterRoles[rb.RoleRef.Name] = true
 		if rb.RoleRef.Kind == "ClusterRole" {
 			usedClusterRoles[rb.RoleRef.Name] = true
@@ -61,9 +58,6 @@ func retrieveUsedClusterRoles(clientset kubernetes.Interface, filterOpts *filter
 	}
 
 	for _, crb := range clusterRoleBindings.Items {
-		if pass, _ := filter.Run(filterOpts); pass {
-			continue
-		}
 		usedClusterRoles[crb.RoleRef.Name] = true
 	}
 
@@ -94,10 +88,8 @@ func retrieveUsedClusterRoles(clientset kubernetes.Interface, filterOpts *filter
 		for _, clusterRole := range clusterRoles.Items {
 			for label, value := range clusterRole.Labels {
 				if slices.Contains(aggregatedLabels, label+": "+value) {
-					usedClusterRoles[clusterRole.Name], err = strconv.ParseBool(value)
-					if err != nil {
-						return nil, fmt.Errorf("couldn't convert string to bool %v", err)
-					}
+					// Aggregated into a used ClusterRole, so it is itself used.
+					usedClusterRoles[clusterRole.Name] = true
 					if clusterRole.AggregationRule == nil {
 						continue
 					}
@@ -124,10 +116,18 @@ func retrieveClusterRoleNames(clientset kubernetes.Interface, filterOpts *filter
 		return nil, nil, err
 	}
 
+	config, err := unmarshalConfig(clusterRolesConfig)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var unusedClusterRoles []string
 	names := make([]string, 0, len(clusterRoles.Items))
 
 	for _, clusterRole := range clusterRoles.Items {
+		if filterOpts.IgnoreOwnerReferences && len(clusterRole.OwnerReferences) > 0 {
+			continue
+		}
 		if pass, _ := filter.SetObject(&clusterRole).Run(filterOpts); pass {
 			continue
 		}
@@ -137,12 +137,12 @@ func retrieveClusterRoleNames(clientset kubernetes.Interface, filterOpts *filter
 			continue
 		}
 
-		config, err := unmarshalConfig(clusterRolesConfig)
+		exceptionFound, err := isResourceException(clusterRole.Name, clusterRole.Namespace, config.ExceptionClusterRoles)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		if isResourceException(clusterRole.Name, "", config.ExceptionClusterRoles) {
+		if exceptionFound {
 			continue
 		}
 
@@ -151,7 +151,7 @@ func retrieveClusterRoleNames(clientset kubernetes.Interface, filterOpts *filter
 	return names, unusedClusterRoles, nil
 }
 
-func processClusterRoles(clientset kubernetes.Interface, filterOpts *filters.Options) ([]string, error) {
+func processClusterRoles(clientset kubernetes.Interface, filterOpts *filters.Options) ([]ResourceInfo, error) {
 	usedClusterRoles, err := retrieveUsedClusterRoles(clientset, filterOpts)
 	if err != nil {
 		return nil, err
@@ -164,30 +164,39 @@ func processClusterRoles(clientset kubernetes.Interface, filterOpts *filters.Opt
 		return nil, err
 	}
 
-	diff := CalculateResourceDifference(usedClusterRoles, clusterRoleNames)
-	diff = append(diff, unusedClusterRoles...)
+	var diff []ResourceInfo
+
+	for _, name := range CalculateResourceDifference(usedClusterRoles, clusterRoleNames) {
+		reason := "ClusterRole is not used by any RoleBinding or ClusterRoleBinding"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+
+	for _, name := range unusedClusterRoles {
+		reason := "Marked with unused label"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
 
 	return diff, nil
 
 }
 
-func GetUnusedClusterRoles(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+func GetUnusedClusterRoles(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
 	diff, err := processClusterRoles(clientset, filterOpts)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to process cluster role : %v\n", err)
-	}
-	switch opts.GroupBy {
-	case "namespace":
-		resources[""] = make(map[string][]string)
-		resources[""]["ClusterRole"] = diff
-	case "resource":
-		appendResources(resources, "ClusterRole", "", diff)
 	}
 	if opts.DeleteFlag {
 		if diff, err = DeleteResource(diff, clientset, "", "ClusterRole", opts.NoInteractive); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to delete clusterRole %s : %v\n", diff, err)
 		}
+	}
+	switch opts.GroupBy {
+	case "namespace":
+		resources[""] = make(map[string][]ResourceInfo)
+		resources[""]["ClusterRole"] = diff
+	case "resource":
+		appendResources(resources, "ClusterRole", "", diff)
 	}
 
 	var outputBuffer bytes.Buffer

@@ -11,64 +11,85 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 //go:embed exceptions/services/services.json
 var servicesConfig []byte
 
-func processNamespaceServices(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]string, error) {
-	endpointsList, err := clientset.CoreV1().Endpoints(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: filterOpts.IncludeLabels})
+func processNamespaceServices(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ([]ResourceInfo, error) {
+	endpointSlices, err := clientset.DiscoveryV1().EndpointSlices(namespace).List(context.TODO(), metav1.ListOptions{LabelSelector: filterOpts.IncludeLabels})
 	if err != nil {
 		return nil, err
 	}
 
-	var endpointsWithoutSubsets []string
+	config, err := unmarshalConfig(servicesConfig)
+	if err != nil {
+		return nil, err
+	}
 
-	for _, endpoints := range endpointsList.Items {
-		if pass, _ := filter.Run(filterOpts); pass {
+	var endpointsWithoutSubsets []ResourceInfo
+
+	for _, endpoints := range endpointSlices.Items {
+		// Skip resources with ownerReferences if the general flag is set
+		if filterOpts.IgnoreOwnerReferences && len(endpoints.OwnerReferences) > 0 {
 			continue
 		}
 
-		config, err := unmarshalConfig(servicesConfig)
+		if pass, _ := filter.SetObject(&endpoints).Run(filterOpts); pass {
+			continue
+		}
+
+		exceptionFound, err := isResourceException(endpoints.Name, endpoints.Namespace, config.ExceptionServices)
 		if err != nil {
 			return nil, err
 		}
 
-		if isResourceException(endpoints.Name, namespace, config.ExceptionServices) {
-			continue
-		}
-		if endpoints.Labels["kor/used"] == "false" {
-			endpointsWithoutSubsets = append(endpointsWithoutSubsets, endpoints.Name)
+		if exceptionFound {
 			continue
 		}
 
-		if len(endpoints.Subsets) == 0 {
-			endpointsWithoutSubsets = append(endpointsWithoutSubsets, endpoints.Name)
+		status := ResourceInfo{Name: endpoints.Labels["kubernetes.io/service-name"]}
+
+		if endpoints.Labels["kor/used"] == "false" {
+			status.Reason = "Marked with unused label"
+			endpointsWithoutSubsets = append(endpointsWithoutSubsets, status)
+			continue
+		} else if len(endpoints.Endpoints) == 0 {
+			status.Reason = "Service has no endpointslices"
+			endpointsWithoutSubsets = append(endpointsWithoutSubsets, status)
+		}
+	}
+
+	if opts.DeleteFlag {
+		if endpointsWithoutSubsets, err = DeleteResource(endpointsWithoutSubsets, clientset, namespace, "Service", opts.NoInteractive); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to delete Service %s in namespace %s: %v\n", endpointsWithoutSubsets, namespace, err)
 		}
 	}
 
 	return endpointsWithoutSubsets, nil
 }
 
-func GetUnusedServices(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+func GetUnusedServices(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
+
 	for _, namespace := range filterOpts.Namespaces(clientset) {
-		diff, err := processNamespaceServices(clientset, namespace, filterOpts)
+		diff, err := processNamespaceServices(clientset, namespace, filterOpts, opts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to process namespace %s: %v\n", namespace, err)
 			continue
 		}
+
 		switch opts.GroupBy {
 		case "namespace":
-			resources[namespace] = make(map[string][]string)
-			resources[namespace]["Service"] = diff
+			if diff != nil {
+				resources[namespace] = make(map[string][]ResourceInfo)
+				resources[namespace]["Service"] = diff
+			}
 		case "resource":
-			appendResources(resources, "Service", namespace, diff)
-		}
-		if opts.DeleteFlag {
-			if diff, err = DeleteResource(diff, clientset, namespace, "Service", opts.NoInteractive); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to delete Service %s in namespace %s: %v\n", diff, namespace, err)
+			if diff != nil {
+				appendResources(resources, "Service", namespace, diff)
 			}
 		}
 	}

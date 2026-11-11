@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,11 @@ type Options struct {
 	ExcludeNamespaces []string
 	// IncludeNamespaces is a namespace selector to include resources in matching namespaces
 	IncludeNamespaces []string
+	// IgnoreOwnerReferences skips any resource that has ownerReferences set (for all resource types)
+	IgnoreOwnerReferences bool
+	// SkipNamespaceValidation skips validating namespace existence via API calls.
+	// Use this in permission-limited clusters where you only have namespace-scoped RBAC (Role/RoleBinding).
+	SkipNamespaceValidation bool
 
 	namespace []string
 	once      sync.Once
@@ -120,25 +126,32 @@ func (o *Options) Namespaces(clientset kubernetes.Interface) []string {
 		excludeNamespaces := o.ExcludeNamespaces
 
 		if len(o.IncludeNamespaces) > 0 {
+			slices.Sort(includeNamespaces)
+			includeNamespaces = slices.Compact(includeNamespaces)
 
-			for _, ns := range includeNamespaces {
-
-				_, err := clientset.CoreV1().Namespaces().Get(context.TODO(), ns, metav1.GetOptions{})
-				if err == nil {
+			if o.SkipNamespaceValidation {
+				fmt.Fprintf(os.Stderr, "Warning: skipping namespace validation for %s; nonexistent namespaces will surface as \"not found\" errors\n", strings.Join(includeNamespaces, ", "))
+				for _, ns := range includeNamespaces {
 					namespacesMap[ns] = true
-				} else {
-					fmt.Fprintf(os.Stderr, "namespace [%s] not found\n", ns)
+				}
+			} else {
+				for _, ns := range includeNamespaces {
+					_, err := clientset.CoreV1().Namespaces().Get(context.TODO(), ns, metav1.GetOptions{})
+					if err == nil {
+						namespacesMap[ns] = true
+					} else {
+						fmt.Fprintf(os.Stderr, "namespace [%s] not found\n", ns)
+					}
 				}
 			}
+		} else if o.SkipNamespaceValidation {
+			fmt.Fprintf(os.Stderr, "--skip-namespace-validation requires --include-namespaces to be set\n")
+			return
 		} else {
 			namespaceList, err := clientset.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Failed to retrieve namespaces: %v\n", err)
-				os.Exit(1)
-			}
-
-			for _, ns := range namespaceList.Items {
-				namespacesMap[ns.Name] = false
+				return
 			}
 
 			for _, ns := range namespaceList.Items {

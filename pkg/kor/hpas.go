@@ -6,12 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
-	"k8s.io/utils/strings/slices"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
@@ -39,7 +40,7 @@ func getStatefulSetNames(clientset kubernetes.Interface, namespace string) ([]st
 	return names, nil
 }
 
-func processNamespaceHpas(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]string, error) {
+func processNamespaceHpas(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ([]ResourceInfo, error) {
 	deploymentNames, err := getDeploymentNames(clientset, namespace)
 	if err != nil {
 		return nil, err
@@ -55,50 +56,55 @@ func processNamespaceHpas(clientset kubernetes.Interface, namespace string, filt
 		return nil, err
 	}
 
-	var unusedHpas []string
+	var unusedHpas []ResourceInfo
 	for _, hpa := range hpas.Items {
 		if pass, _ := filter.SetObject(&hpa).Run(filterOpts); pass {
 			continue
 		}
 
+		// Skip if resource has owner references and ignore flag is set
+		if filterOpts.IgnoreOwnerReferences && len(hpa.OwnerReferences) > 0 {
+			continue
+		}
+
 		if hpa.Labels["kor/used"] == "false" {
-			unusedHpas = append(unusedHpas, hpa.Name)
+			unusedHpas = append(unusedHpas, ResourceInfo{Name: hpa.Name, Reason: "Marked with unused label"})
 			continue
 		}
 
 		switch hpa.Spec.ScaleTargetRef.Kind {
 		case "Deployment":
 			if !slices.Contains(deploymentNames, hpa.Spec.ScaleTargetRef.Name) {
-				unusedHpas = append(unusedHpas, hpa.Name)
+				unusedHpas = append(unusedHpas, ResourceInfo{Name: hpa.Name, Reason: "Scale target Deployment does not exist"})
 			}
 		case "StatefulSet":
 			if !slices.Contains(statefulsetNames, hpa.Spec.ScaleTargetRef.Name) {
-				unusedHpas = append(unusedHpas, hpa.Name)
+				unusedHpas = append(unusedHpas, ResourceInfo{Name: hpa.Name, Reason: "Scale target StatefulSet does not exist"})
 			}
+		}
+	}
+	if opts.DeleteFlag {
+		if unusedHpas, err = DeleteResource(unusedHpas, clientset, namespace, "HPA", opts.NoInteractive); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to delete HPA %s in namespace %s: %v\n", unusedHpas, namespace, err)
 		}
 	}
 	return unusedHpas, nil
 }
 
-func GetUnusedHpas(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+func GetUnusedHpas(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
 	for _, namespace := range filterOpts.Namespaces(clientset) {
-		diff, err := processNamespaceHpas(clientset, namespace, filterOpts)
+		diff, err := processNamespaceHpas(clientset, namespace, filterOpts, opts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to process namespace %s: %v\n", namespace, err)
 			continue
 		}
 		switch opts.GroupBy {
 		case "namespace":
-			resources[namespace] = make(map[string][]string)
+			resources[namespace] = make(map[string][]ResourceInfo)
 			resources[namespace]["Hpa"] = diff
 		case "resource":
 			appendResources(resources, "Hpa", namespace, diff)
-		}
-		if opts.DeleteFlag {
-			if diff, err = DeleteResource(diff, clientset, namespace, "HPA", opts.NoInteractive); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to delete HPA %s in namespace %s: %v\n", diff, namespace, err)
-			}
 		}
 	}
 

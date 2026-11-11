@@ -11,7 +11,7 @@ import (
 
 var replicaSetCmd = &cobra.Command{
 	Use:     "replicaset",
-	Aliases: []string{"rs", "replicaset", "replicasets"},
+	Aliases: []string{"rs", "replicasets"},
 	Short:   "Gets unused replicaSets",
 	Args:    cobra.ExactArgs(0),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -20,7 +20,7 @@ var replicaSetCmd = &cobra.Command{
 		if response, err := kor.GetUnusedReplicaSets(filterOptions, clientset, outputFormat, opts); err != nil {
 			fmt.Println(err)
 		} else {
-			utils.PrintLogo(outputFormat)
+			utils.PrintLogo(outputFormat, opts.ClusterName)
 			fmt.Println(response)
 		}
 	},

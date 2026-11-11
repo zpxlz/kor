@@ -1,55 +1,53 @@
 package kor
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
-	"strings"
 
-	"github.com/olekukonko/tablewriter"
 	apiextensionsclientset "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
-	"sigs.k8s.io/yaml"
 )
+
+var ResourceKindList map[string]ResourceKind
 
 type ExceptionResource struct {
 	Namespace    string
 	ResourceName string
+	MatchRegex   bool
 }
 type IncludeExcludeLists struct {
 	IncludeListStr string
 	ExcludeListStr string
 }
-
-type Config struct {
-	ExceptionClusterRoles    []ExceptionResource `json:"exceptionClusterRoles"`
-	ExceptionConfigMaps      []ExceptionResource `json:"exceptionConfigMaps"`
-	ExceptionCrds            []ExceptionResource `json:"exceptionCrds"`
-	ExceptionDaemonSets      []ExceptionResource `json:"exceptionDaemonSets"`
-	ExceptionRoles           []ExceptionResource `json:"exceptionRoles"`
-	ExceptionSecrets         []ExceptionResource `json:"exceptionSecrets"`
-	ExceptionServiceAccounts []ExceptionResource `json:"exceptionServiceAccounts"`
-	ExceptionServices        []ExceptionResource `json:"exceptionServices"`
-	ExceptionStorageClasses  []ExceptionResource `json:"exceptionStorageClasses"`
-	ExceptionJobs            []ExceptionResource `json:"exceptionJobs"`
-	// Add other configurations if needed
+type ResourceKind struct {
+	Plural     string
+	ShortNames []string
 }
 
-type Opts struct {
-	DeleteFlag    bool
-	NoInteractive bool
-	Verbose       bool
-	WebhookURL    string
-	Channel       string
-	Token         string
-	GroupBy       string
+type Config struct {
+	ExceptionClusterRoles        []ExceptionResource `json:"exceptionClusterRoles"`
+	ExceptionClusterRoleBindings []ExceptionResource `json:"exceptionClusterRoleBindings"`
+	ExceptionConfigMaps          []ExceptionResource `json:"exceptionConfigMaps"`
+	ExceptionCrds                []ExceptionResource `json:"exceptionCrds"`
+	ExceptionDaemonSets          []ExceptionResource `json:"exceptionDaemonSets"`
+	ExceptionRoles               []ExceptionResource `json:"exceptionRoles"`
+	ExceptionSecrets             []ExceptionResource `json:"exceptionSecrets"`
+	ExceptionServiceAccounts     []ExceptionResource `json:"exceptionServiceAccounts"`
+	ExceptionServices            []ExceptionResource `json:"exceptionServices"`
+	ExceptionStorageClasses      []ExceptionResource `json:"exceptionStorageClasses"`
+	ExceptionJobs                []ExceptionResource `json:"exceptionJobs"`
+	ExceptionPdbs                []ExceptionResource `json:"exceptionPdbs"`
+	ExceptionRoleBindings        []ExceptionResource `json:"exceptionRoleBindings"`
+	ExceptionPriorityClasses     []ExceptionResource `json:"exceptionPriorityClasses"`
+	// Add other configurations if needed
 }
 
 func RemoveDuplicatesAndSort(slice []string) []string {
@@ -70,20 +68,48 @@ func GetKubeConfigPath() string {
 	return filepath.Join(home, ".kube", "config")
 }
 
-func GetConfig(kubeconfig string) (*rest.Config, error) {
-	if _, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/token"); err == nil {
-		return rest.InClusterConfig()
+func isRunningInCluster() bool {
+	_, err := os.Stat("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	return err == nil
+}
+
+func GetClusterName(kubeconfig string) string {
+	if isRunningInCluster() {
+		return ""
 	}
 
-	if kubeconfig == "" {
-		if configEnv := os.Getenv("KUBECONFIG"); configEnv != "" {
-			kubeconfig = configEnv
-		} else {
-			kubeconfig = GetKubeConfigPath()
+	loader := clientcmd.NewDefaultClientConfigLoadingRules()
+	loader.ExplicitPath = kubeconfig
+	overrides := &clientcmd.ConfigOverrides{}
+	config := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loader, overrides)
+	rawConfig, err := config.RawConfig()
+	if err != nil {
+		return ""
+	}
+
+	contexts, ok := rawConfig.Contexts[rawConfig.CurrentContext]
+	if !ok || contexts.Cluster == "" {
+		return ""
+	}
+
+	return contexts.Cluster
+}
+
+func GetConfig(kubeconfig string) (*rest.Config, error) {
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+
+	if kubeconfig != "" {
+		loadingRules.ExplicitPath = kubeconfig
+	} else {
+		if isRunningInCluster() {
+			return rest.InClusterConfig()
 		}
 	}
 
-	return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	configOverrides := &clientcmd.ConfigOverrides{}
+	kubeConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+
+	return kubeConfig.ClientConfig()
 }
 
 func GetKubeClient(kubeconfig string) *kubernetes.Clientset {
@@ -131,127 +157,6 @@ func GetDynamicClient(kubeconfig string) *dynamic.DynamicClient {
 	return clientset
 }
 
-func appendResources(resources map[string]map[string][]string, resourceType, namespace string, diff []string) {
-	for _, d := range diff {
-		if _, ok := resources[resourceType]; !ok {
-			resources[resourceType] = make(map[string][]string)
-		}
-		resources[resourceType][namespace] = append(resources[resourceType][namespace], d)
-	}
-}
-
-func getTableHeader(groupBy string) []string {
-	switch groupBy {
-	case "namespace":
-		return []string{
-			"#",
-			"RESOURCE TYPE",
-			"RESOURCE NAME",
-		}
-	case "resource":
-		return []string{
-			"#",
-			"NAMESPACE",
-			"RESOURCE NAME",
-		}
-	default:
-		return nil
-	}
-}
-
-func getTableRow(index int, columns ...string) []string {
-	row := make([]string, 0, len(columns)+1)
-	row = append(row, fmt.Sprintf("%d", index+1))
-	row = append(row, columns...)
-	return row
-}
-
-// FormatOutput formats the output based on the group by option
-func FormatOutput(resources map[string]map[string][]string, opts Opts) bytes.Buffer {
-	var output bytes.Buffer
-	switch opts.GroupBy {
-	case "namespace":
-		for namespace, diffs := range resources {
-			output.WriteString(formatOutputForNamespace(namespace, diffs, opts))
-		}
-	case "resource":
-		for resource, diffs := range resources {
-			output.WriteString(formatOutputForResource(resource, diffs, opts))
-		}
-	}
-	return output
-}
-
-func formatOutputForResource(resource string, resources map[string][]string, opts Opts) string {
-	if len(resources) == 0 {
-		if opts.Verbose {
-			return fmt.Sprintf("No unused %ss found\n", resource)
-		}
-		return ""
-	}
-	var buf bytes.Buffer
-	table := tablewriter.NewWriter(&buf)
-	table.SetHeader(getTableHeader(opts.GroupBy))
-	var index int
-	for ns, diffs := range resources {
-		for _, d := range diffs {
-			row := getTableRow(index, ns, d)
-			table.Append(row)
-			index++
-		}
-	}
-	table.Render()
-	return fmt.Sprintf("Unused %ss:\n%s\n", resource, buf.String())
-}
-
-func formatOutputForNamespace(namespace string, resources map[string][]string, opts Opts) string {
-	var buf bytes.Buffer
-	table := tablewriter.NewWriter(&buf)
-	table.SetHeader(getTableHeader(opts.GroupBy))
-	allEmpty := true
-	var index int
-	for resourceType, diff := range resources {
-		for _, val := range diff {
-			row := getTableRow(index, resourceType, val)
-			table.Append(row)
-			allEmpty = false
-			index++
-		}
-	}
-	if allEmpty {
-		if opts.Verbose {
-			return fmt.Sprintf("No unused resources found in the namespace: %q\n", namespace)
-		}
-		return ""
-	}
-	table.Render()
-	return fmt.Sprintf("Unused resources in namespace: %q\n%s\n", namespace, buf.String())
-}
-
-func FormatOutputAll(namespace string, allDiffs []ResourceDiff, opts Opts) string {
-	var buf bytes.Buffer
-	table := tablewriter.NewWriter(&buf)
-	table.SetHeader(getTableHeader(opts.GroupBy))
-	allEmpty := true
-	var index int
-	for _, data := range allDiffs {
-		for _, val := range data.diff {
-			row := getTableRow(index, data.resourceType, val)
-			table.Append(row)
-			allEmpty = false
-			index++
-		}
-	}
-	if allEmpty {
-		if opts.Verbose {
-			return fmt.Sprintf("No unused resources found in the namespace: %q\n", namespace)
-		}
-		return ""
-	}
-	table.Render()
-	return fmt.Sprintf("Unused resources in namespace: %q\n%s\n", namespace, buf.String())
-}
-
 // TODO create formatter by resource "#", "Resource Name", "Namespace"
 // TODO Functions that use this object are accompanied by repeated data acquisition operations and can be optimized.
 func CalculateResourceDifference(usedResourceNames []string, allResourceNames []string) []string {
@@ -271,41 +176,30 @@ func CalculateResourceDifference(usedResourceNames []string, allResourceNames []
 	return difference
 }
 
-func unusedResourceFormatter(outputFormat string, outputBuffer bytes.Buffer, opts Opts, jsonResponse []byte) (string, error) {
-	switch outputFormat {
-	case "table":
-		if opts.WebhookURL == "" || opts.Channel == "" || opts.Token != "" {
-			return outputBuffer.String(), nil
-		}
-		if err := SendToSlack(SlackMessage{}, opts, outputBuffer.String()); err != nil {
-			return "", fmt.Errorf("failed to send message to slack: %w", err)
-		}
-	case "yaml":
-		yamlResponse, err := yaml.JSONToYAML(jsonResponse)
-		if err != nil {
-			return "", fmt.Errorf("failed to convert json to yaml: %w", err)
-		}
-		return string(yamlResponse), nil
-	}
-	return string(jsonResponse), nil
-}
-
-func isResourceException(resourceName, namespace string, exceptions []ExceptionResource) bool {
+func isResourceException(resourceName, namespace string, exceptions []ExceptionResource) (bool, error) {
 	var match bool
 	for _, e := range exceptions {
 		if e.ResourceName == resourceName && e.Namespace == namespace {
 			match = true
 			break
 		}
-		if strings.HasSuffix(e.ResourceName, "*") {
-			resourceNameMatched := strings.HasPrefix(resourceName, strings.TrimSuffix(e.ResourceName, "*"))
-			if resourceNameMatched && e.Namespace == namespace {
+
+		if e.MatchRegex {
+			namespaceRegexp, err := regexp.Compile(e.Namespace)
+			if err != nil {
+				return false, err
+			}
+			nameRegexp, err := regexp.Compile(e.ResourceName)
+			if err != nil {
+				return false, err
+			}
+			if nameRegexp.MatchString(resourceName) && namespaceRegexp.MatchString(namespace) {
 				match = true
 				break
 			}
 		}
 	}
-	return match
+	return match, nil
 }
 
 func unmarshalConfig(data []byte) (*Config, error) {
@@ -314,4 +208,67 @@ func unmarshalConfig(data []byte) (*Config, error) {
 		return nil, err
 	}
 	return &config, nil
+}
+
+func contains(slice []string, item string) bool {
+	for _, element := range slice {
+		if element == item {
+			return true
+		}
+	}
+	return false
+}
+
+func resourceInfoContains(slice []ResourceInfo, item string) bool {
+	for _, element := range slice {
+		if element.Name == item {
+			return true
+		}
+	}
+	return false
+}
+
+// Convert a slice of names into a map for fast lookup
+func convertNamesToPresenseMap(names []string, _ []string, err error) (map[string]bool, error) {
+	if err != nil {
+		return nil, err
+	}
+
+	namesMap := make(map[string]bool)
+	for _, n := range names {
+		namesMap[n] = true
+	}
+
+	return namesMap, nil
+}
+
+func GetResourceKinds(clientset kubernetes.Interface) (map[string]ResourceKind, error) {
+	resourceTypes, err := clientset.Discovery().ServerPreferredResources()
+	if err != nil {
+		return nil, fmt.Errorf("error fetching server resources: %v", err)
+	}
+
+	kinds := make(map[string]ResourceKind)
+
+	for _, list := range resourceTypes {
+		if list == nil {
+			continue // Skip nil lists (can happen if some APIs are unavailable)
+		}
+
+		for _, resource := range list.APIResources {
+			singularName := resource.SingularName
+			if singularName == "" {
+				singularName = resource.Name
+			}
+
+			resourceKind := ResourceKind{
+				Plural:     resource.Name,
+				ShortNames: resource.ShortNames,
+			}
+
+			kinds[singularName] = resourceKind
+		}
+	}
+
+	return kinds, nil
 }

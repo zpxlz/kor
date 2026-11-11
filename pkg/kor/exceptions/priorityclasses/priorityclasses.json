@@ -1,0 +1,8 @@
+{
+    "exceptionPriorityClasses": [
+        {
+            "Namespace": "",
+            "ResourceName": "system-node-critical"
+        }
+    ]
+}

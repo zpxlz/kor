@@ -1,0 +1,447 @@
+package kor
+
+import (
+	"context"
+	"encoding/json"
+	"reflect"
+	"runtime"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/yonahd/kor/pkg/common"
+	"github.com/yonahd/kor/pkg/filters"
+)
+
+func createTestMultiResources(t *testing.T) *fake.Clientset {
+	clientset := fake.NewClientset()
+
+	ResourceKindList = map[string]ResourceKind{
+		"configmap": {
+			Plural:     "configmaps",
+			ShortNames: []string{"cm"},
+		},
+		"poddisruptionbudget": {
+			Plural:     "poddisruptionbudgets",
+			ShortNames: []string{"pdb"},
+		},
+		"deployment": {
+			Plural:     "deployments",
+			ShortNames: []string{"deploy"},
+		},
+	}
+
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
+		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
+	}, v1.CreateOptions{})
+
+	if err != nil {
+		t.Fatalf("Error creating namespace %s: %v", testNamespace, err)
+	}
+
+	deployment1 := CreateTestDeployment(testNamespace, "test-deployment1", 0, AppLabels)
+	_, err = clientset.AppsV1().Deployments(testNamespace).Create(context.TODO(), deployment1, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake deployment: %v", err)
+	}
+
+	configmap1 := CreateTestConfigmap(testNamespace, "configmap-1", AppLabels)
+	_, err = clientset.CoreV1().ConfigMaps(testNamespace).Create(context.TODO(), configmap1, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake configmap: %v", err)
+	}
+
+	return clientset
+
+}
+
+func TestRetrieveNamespaceDiff(t *testing.T) {
+	clientset := createTestMultiResources(t)
+	resourceList := []string{"cm", "pdb", "deployment"}
+	filterOpts := &filters.Options{}
+
+	namespaceDiff := retrieveNamespaceDiffs(clientset, testNamespace, resourceList, filterOpts, common.Opts{})
+
+	if len(namespaceDiff) != 3 {
+		t.Fatalf("Expected 3 diffs, got %d", len(namespaceDiff))
+	}
+
+	if namespaceDiff[0].resourceType != "ConfigMap" && namespaceDiff[0].diff[0].Name != "configmap-1" {
+		t.Fatalf("Expected configmap-1, got %s", namespaceDiff[0].diff[0].Name)
+	}
+
+	if namespaceDiff[1].resourceType != "Pdb" && namespaceDiff[1].diff != nil {
+		t.Fatalf("Expected nil, got %s", namespaceDiff[1].diff[0].Name)
+	}
+
+	if namespaceDiff[2].resourceType != "Deployment" && namespaceDiff[2].diff[0].Name != "test-deployment1" {
+		t.Fatalf("Expected test-deployment1, got %s", namespaceDiff[2].diff[0].Name)
+	}
+
+}
+
+func TestGetUnusedMulti(t *testing.T) {
+	clientset := createTestMultiResources(t)
+	resourceList := "cm,pdb,deployment"
+
+	opts := common.Opts{
+		WebhookURL:    "",
+		Channel:       "",
+		Token:         "",
+		DeleteFlag:    false,
+		NoInteractive: true,
+		GroupBy:       "namespace",
+	}
+
+	output, err := GetUnusedMulti(resourceList, &filters.Options{}, clientset, nil, nil, "json", opts)
+
+	if err != nil {
+		t.Fatalf("Error calling GetUnusedMulti: %v", err)
+	}
+
+	expectedOutput := map[string]map[string][]string{
+		"test-namespace": {
+			"ConfigMap": {
+				"configmap-1",
+			},
+			"Deployment": {
+				"test-deployment1",
+			},
+		},
+	}
+
+	var actualOutput map[string]map[string][]string
+	if err := json.Unmarshal([]byte(output), &actualOutput); err != nil {
+		t.Fatalf("Error unmarshaling actual output: %v", err)
+	}
+
+	if !reflect.DeepEqual(expectedOutput, actualOutput) {
+		t.Errorf("Expected output does not match \n actualOutput:\n %s \n expectedOutput:\n %s", actualOutput, expectedOutput)
+	}
+
+}
+
+func TestGetUnusedMultiGroupByResource(t *testing.T) {
+	clientset := createTestMultiResources(t)
+	resourceList := "cm,pdb,deployment"
+
+	opts := common.Opts{
+		WebhookURL:    "",
+		Channel:       "",
+		Token:         "",
+		DeleteFlag:    false,
+		NoInteractive: true,
+		GroupBy:       "resource",
+	}
+
+	output, err := GetUnusedMulti(resourceList, &filters.Options{}, clientset, nil, nil, "json", opts)
+	if err != nil {
+		t.Fatalf("Error calling GetUnusedMulti: %v", err)
+	}
+
+	expectedOutput := map[string]map[string][]string{
+		"ConfigMap": {
+			"test-namespace": {
+				"configmap-1",
+			},
+		},
+		"Deployment": {
+			"test-namespace": {
+				"test-deployment1",
+			},
+		},
+	}
+
+	var actualOutput map[string]map[string][]string
+	if err := json.Unmarshal([]byte(output), &actualOutput); err != nil {
+		t.Fatalf("Error unmarshaling actual output: %v", err)
+	}
+
+	if !reflect.DeepEqual(expectedOutput, actualOutput) {
+		t.Errorf("Expected output does not match \n actualOutput:\n %s \n expectedOutput:\n %s", actualOutput, expectedOutput)
+	}
+}
+
+func TestGetUnusedMultiWithMultipleResources(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	ResourceKindList = map[string]ResourceKind{
+		"configmap": {
+			Plural:     "configmaps",
+			ShortNames: []string{"cm"},
+		},
+		"secret": {
+			Plural:     "secrets",
+			ShortNames: []string{},
+		},
+		"deployment": {
+			Plural:     "deployments",
+			ShortNames: []string{"deploy"},
+		},
+	}
+
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
+		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
+	}, v1.CreateOptions{})
+
+	if err != nil {
+		t.Fatalf("Error creating namespace %s: %v", testNamespace, err)
+	}
+
+	// Create multiple test resources
+	deployment1 := CreateTestDeployment(testNamespace, "test-deployment1", 0, AppLabels)
+	_, err = clientset.AppsV1().Deployments(testNamespace).Create(context.TODO(), deployment1, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake deployment: %v", err)
+	}
+
+	configmap1 := CreateTestConfigmap(testNamespace, "configmap-1", AppLabels)
+	_, err = clientset.CoreV1().ConfigMaps(testNamespace).Create(context.TODO(), configmap1, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake configmap: %v", err)
+	}
+
+	secret1 := CreateTestSecret(testNamespace, "secret-1", AppLabels)
+	_, err = clientset.CoreV1().Secrets(testNamespace).Create(context.TODO(), secret1, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake secret: %v", err)
+	}
+
+	resourceList := "configmap,secret,deployment"
+
+	opts := common.Opts{
+		WebhookURL:    "",
+		Channel:       "",
+		Token:         "",
+		DeleteFlag:    false,
+		NoInteractive: true,
+		GroupBy:       "namespace",
+	}
+
+	output, err := GetUnusedMulti(resourceList, &filters.Options{}, clientset, nil, nil, "json", opts)
+
+	if err != nil {
+		t.Fatalf("Error calling GetUnusedMulti: %v", err)
+	}
+
+	var actualOutput map[string]map[string][]interface{}
+	if err := json.Unmarshal([]byte(output), &actualOutput); err != nil {
+		t.Fatalf("Error unmarshaling actual output: %v", err)
+	}
+
+	// Verify all three resource types are present in output
+	if _, exists := actualOutput[testNamespace]["ConfigMap"]; !exists {
+		t.Errorf("ConfigMap should be present in output")
+	}
+	if _, exists := actualOutput[testNamespace]["Secret"]; !exists {
+		t.Errorf("Secret should be present in output")
+	}
+	if _, exists := actualOutput[testNamespace]["Deployment"]; !exists {
+		t.Errorf("Deployment should be present in output")
+	}
+
+	t.Logf("Multi-resource output: %s", output)
+}
+
+func TestGetCanonicalResourceType(t *testing.T) {
+	_ = createTestMultiResources(t)
+
+	cases := []struct {
+		input    string
+		expected string
+	}{
+		{"configmap", "configmap"},
+		{"ConfigMap", "configmap"},
+		{"configmaps", "configmap"},
+		{"cm", "configmap"},
+		{"poddisruptionbudgets", "poddisruptionbudget"},
+		{"pdb", "poddisruptionbudget"},
+		{"deploy", "deployment"},
+		{"unknown", "unknown"},
+	}
+
+	for _, c := range cases {
+		got := getCanonicalResourceType(c.input)
+		if got != c.expected {
+			t.Errorf("For input %q expected %q, got %q", c.input, c.expected, got)
+		}
+	}
+}
+
+func TestRetrieveNoNamespaceDiff(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	ResourceKindList = map[string]ResourceKind{
+		"configmap": {
+			Plural:     "configmaps",
+			ShortNames: []string{"cm"},
+		},
+		"persistentvolume": {
+			Plural:     "persistentvolumes",
+			ShortNames: []string{"pv"},
+		},
+		"clusterrole": {
+			Plural:     "clusterroles",
+			ShortNames: []string{},
+		},
+		"customresourcedefinition": {
+			Plural:     "customresourcedefinitions",
+			ShortNames: []string{"crd"},
+		},
+	}
+
+	_, err := clientset.CoreV1().PersistentVolumes().Create(context.TODO(), CreateTestPv("test-pv", "Available", AppLabels, "test-sc1"), v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake PV: %v", err)
+	}
+
+	_, err = clientset.RbacV1().ClusterRoles().Create(context.TODO(), CreateTestClusterRole("test-cluster-role", AppLabels), v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake ClusterRole: %v", err)
+	}
+
+	apiExtClient, dynamicClient := createTestCRDs(t)
+
+	noNamespaceDiff, clearedResourceList := retrieveNoNamespaceDiff(
+		clientset,
+		apiExtClient,
+		dynamicClient,
+		[]string{"configmap", "persistentvolume", "clusterrole", "customresourcedefinition"},
+		&filters.Options{},
+		common.Opts{GroupBy: "namespace"},
+	)
+
+	if len(clearedResourceList) != 1 || clearedResourceList[0] != "configmap" {
+		t.Errorf("Expected only configmap to remain, got %v", clearedResourceList)
+	}
+
+	if len(noNamespaceDiff) != 3 {
+		t.Fatalf("Expected 3 non-namespaced diffs, got %d", len(noNamespaceDiff))
+	}
+
+	var resourceTypes []string
+	for _, diff := range noNamespaceDiff {
+		resourceTypes = append(resourceTypes, diff.resourceType)
+		if len(diff.diff) == 0 {
+			t.Errorf("Expected non-empty diff for %s", diff.resourceType)
+		}
+	}
+
+	for _, expected := range []string{"Pv", "ClusterRole", "Crd"} {
+		if !contains(resourceTypes, expected) {
+			t.Errorf("Expected diff of type %s, got %v", expected, resourceTypes)
+		}
+	}
+}
+
+func TestGetUnusedMultiWithNonNamespacedResources(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	ResourceKindList = map[string]ResourceKind{
+		"configmap": {
+			Plural:     "configmaps",
+			ShortNames: []string{"cm"},
+		},
+		"persistentvolume": {
+			Plural:     "persistentvolumes",
+			ShortNames: []string{"pv"},
+		},
+		"priorityclass": {
+			Plural:     "priorityclasses",
+			ShortNames: []string{},
+		},
+	}
+
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
+		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
+	}, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating namespace %s: %v", testNamespace, err)
+	}
+
+	_, err = clientset.CoreV1().ConfigMaps(testNamespace).Create(context.TODO(), CreateTestConfigmap(testNamespace, "configmap-1", AppLabels), v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake configmap: %v", err)
+	}
+
+	_, err = clientset.CoreV1().PersistentVolumes().Create(context.TODO(), CreateTestPv("test-pv", "Available", AppLabels, "test-sc1"), v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake PV: %v", err)
+	}
+
+	_, err = clientset.SchedulingV1().PriorityClasses().Create(context.TODO(), CreateTestPriorityClass("test-pc", 1000), v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake PriorityClass: %v", err)
+	}
+
+	opts := common.Opts{
+		WebhookURL:    "",
+		Channel:       "",
+		Token:         "",
+		DeleteFlag:    false,
+		NoInteractive: true,
+		GroupBy:       "namespace",
+	}
+
+	output, err := GetUnusedMulti("configmap,persistentvolume,priorityclass", &filters.Options{}, clientset, nil, nil, "json", opts)
+	if err != nil {
+		t.Fatalf("Error calling GetUnusedMulti: %v", err)
+	}
+
+	expectedOutput := map[string]map[string][]string{
+		testNamespace: {
+			"ConfigMap": {
+				"configmap-1",
+			},
+		},
+		"": {
+			"Pv": {
+				"test-pv",
+			},
+			"PriorityClass": {
+				"test-pc",
+			},
+		},
+	}
+
+	var actualOutput map[string]map[string][]string
+	if err := json.Unmarshal([]byte(output), &actualOutput); err != nil {
+		t.Fatalf("Error unmarshaling actual output: %v", err)
+	}
+
+	if !reflect.DeepEqual(expectedOutput, actualOutput) {
+		t.Errorf("Expected output does not match \n actualOutput:\n %s \n expectedOutput:\n %s", actualOutput, expectedOutput)
+	}
+}
+
+func TestRetrieveResourceDiffsImprovesSpeedWithParallelism(t *testing.T) {
+	resourceList := []string{"configmap", "deployment", "secret", "pod"}
+	originalMaxProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(originalMaxProcs)
+
+	diffRetriever := func(resource string) ResourceDiff {
+		time.Sleep(40 * time.Millisecond)
+		return ResourceDiff{resourceType: resource}
+	}
+
+	start := time.Now()
+	sequentialDiffs := retrieveResourceDiffs(resourceList, diffRetriever)
+	sequentialDuration := time.Since(start)
+
+	runtime.GOMAXPROCS(4)
+	start = time.Now()
+	parallelDiffs := retrieveResourceDiffs(resourceList, diffRetriever)
+	parallelDuration := time.Since(start)
+
+	if !reflect.DeepEqual(sequentialDiffs, parallelDiffs) {
+		t.Fatalf("Expected same diff results for sequential and parallel retrieval")
+	}
+
+	t.Logf("multi helper sequential duration=%s parallel duration=%s", sequentialDuration, parallelDuration)
+	if parallelDuration >= sequentialDuration {
+		t.Fatalf("Expected parallel execution to be faster. sequential=%s parallel=%s", sequentialDuration, parallelDuration)
+	}
+}

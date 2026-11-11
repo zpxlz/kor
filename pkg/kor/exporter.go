@@ -15,11 +15,12 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 var (
-	orphanedResourcesCounter = prometheus.NewGaugeVec(
+	orphanedResourcesGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "kubernetes_orphaned_resources",
 			Help: "Orphaned resources in Kubernetes",
@@ -29,11 +30,11 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(orphanedResourcesCounter)
+	prometheus.MustRegister(orphanedResourcesGauge)
 }
 
 // TODO: add option to change port / url !?
-func Exporter(filterOptions *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts Opts, resourceList []string) {
+func Exporter(filterOptions *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts common.Opts, resourceList []string) {
 	http.Handle("/metrics", promhttp.Handler())
 	fmt.Println("Server listening on :8080")
 	go exportMetrics(filterOptions, clientset, apiExtClient, dynamicClient, outputFormat, opts, resourceList) // Start exporting metrics in the background
@@ -42,7 +43,7 @@ func Exporter(filterOptions *filters.Options, clientset kubernetes.Interface, ap
 	}
 }
 
-func exportMetrics(filterOptions *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts Opts, resourceList []string) {
+func exportMetrics(filterOptions *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts common.Opts, resourceList []string) {
 	exporterInterval := os.Getenv("EXPORTER_INTERVAL")
 	if exporterInterval == "" {
 		exporterInterval = "10"
@@ -65,21 +66,34 @@ func exportMetrics(filterOptions *filters.Options, clientset kubernetes.Interfac
 				return
 			}
 
-			orphanedResourcesCounter.Reset()
-
-			for namespace, resources := range data {
-				for kind, resourceList := range resources {
-					for _, resourceName := range resourceList {
-						orphanedResourcesCounter.WithLabelValues(kind, namespace, resourceName).Set(1)
-					}
-				}
-			}
+			orphanedResourcesGauge.Reset()
+			setOrphanedResourceMetrics(data, opts.GroupBy)
 			time.Sleep(time.Duration(exporterIntervalValue) * time.Minute)
 		}
 	}
 }
 
-func getUnusedResources(filterOptions *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts Opts, resourceList []string) (string, error) {
+func setOrphanedResourceMetrics(data map[string]map[string][]string, groupBy string) {
+	labelValues := func(outerKey, innerKey string) (kind, namespace string) {
+		return innerKey, outerKey
+	}
+	if groupBy == "resource" {
+		labelValues = func(outerKey, innerKey string) (kind, namespace string) {
+			return outerKey, innerKey
+		}
+	}
+
+	for outerKey, resources := range data {
+		for innerKey, resourceList := range resources {
+			for _, resourceName := range resourceList {
+				kind, namespace := labelValues(outerKey, innerKey)
+				orphanedResourcesGauge.WithLabelValues(kind, namespace, resourceName).Set(1)
+			}
+		}
+	}
+}
+
+func getUnusedResources(filterOptions *filters.Options, clientset kubernetes.Interface, apiExtClient apiextensionsclientset.Interface, dynamicClient dynamic.Interface, outputFormat string, opts common.Opts, resourceList []string) (string, error) {
 	if len(resourceList) == 0 || (len(resourceList) == 1 && resourceList[0] == "all") {
 		return GetUnusedAll(filterOptions, clientset, apiExtClient, dynamicClient, outputFormat, opts)
 	}

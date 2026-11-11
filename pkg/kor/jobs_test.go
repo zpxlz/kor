@@ -15,11 +15,12 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 func createTestJobs(t *testing.T) *fake.Clientset {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
 		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
@@ -89,25 +90,80 @@ func createTestJobs(t *testing.T) *fake.Clientset {
 		t.Fatalf("Error creating fake job: %v", err)
 	}
 
+	job6 := CreateTestJob(testNamespace, "test-job6", &batchv1.JobStatus{
+		Succeeded: 0,
+		Failed:    1,
+		Conditions: []batchv1.JobCondition{
+			{
+				Type:    batchv1.JobFailed,
+				Status:  corev1.ConditionTrue,
+				Reason:  "DeadlineExceeded",
+				Message: "Job was active longer than specified deadline",
+			},
+		},
+	}, AppLabels)
+
+	_, err = clientset.BatchV1().Jobs(testNamespace).Create(context.TODO(), job6, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake job: %v", err)
+	}
+
+	job7 := CreateTestJob(testNamespace, "test-job7", &batchv1.JobStatus{
+		Succeeded: 0,
+		Failed:    1,
+		Conditions: []batchv1.JobCondition{
+			{
+				Type:    batchv1.JobFailed,
+				Status:  corev1.ConditionTrue,
+				Reason:  "FailedIndexes",
+				Message: "Job has failed indexes",
+			},
+		},
+	}, AppLabels)
+
+	_, err = clientset.BatchV1().Jobs(testNamespace).Create(context.TODO(), job7, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake job: %v", err)
+	}
+
+	job8 := CreateTestJob(testNamespace, "test-job8", &batchv1.JobStatus{
+		Succeeded: 0,
+		Failed:    1,
+		Conditions: []batchv1.JobCondition{
+			{
+				Type:    batchv1.JobSuspended,
+				Status:  corev1.ConditionTrue,
+				Reason:  "JobSuspended",
+				Message: "Job suspended",
+			},
+		},
+	}, AppLabels)
+
+	_, err = clientset.BatchV1().Jobs(testNamespace).Create(context.TODO(), job8, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake job: %v", err)
+	}
+
 	return clientset
 }
 
 func TestProcessNamespaceJobs(t *testing.T) {
 	clientset := createTestJobs(t)
 
-	unusedJobs, err := processNamespaceJobs(clientset, testNamespace, &filters.Options{})
+	unusedJobs, err := processNamespaceJobs(clientset, testNamespace, &filters.Options{}, common.Opts{})
 	if err != nil {
 		t.Errorf("Expected no error, got %v", err)
 	}
 
-	if len(unusedJobs) != 3 {
-		t.Errorf("Expected 3 jobs unused got %d", len(unusedJobs))
+	expectedJobsNames := []string{"test-job2", "test-job4", "test-job5", "test-job6", "test-job7", "test-job8"}
+
+	if len(unusedJobs) != len(expectedJobsNames) {
+		t.Errorf("Expected %d jobs unused got %d", len(expectedJobsNames), len(unusedJobs))
 	}
 
-	expectedJobs := []string{"test-job2", "test-job4", "test-job5"}
-	for _, jobName := range expectedJobs {
-		if !contains(unusedJobs, jobName) {
-			t.Errorf("Expected job %s to be considered unused, but it was not found", jobName)
+	for i, job := range unusedJobs {
+		if job.Name != expectedJobsNames[i] {
+			t.Errorf("Expected %s, got %s", expectedJobsNames[i], job.Name)
 		}
 	}
 }
@@ -115,7 +171,7 @@ func TestProcessNamespaceJobs(t *testing.T) {
 func TestGetUnusedJobsStructured(t *testing.T) {
 	clientset := createTestJobs(t)
 
-	opts := Opts{
+	opts := common.Opts{
 		WebhookURL:    "",
 		Channel:       "",
 		Token:         "",
@@ -135,6 +191,9 @@ func TestGetUnusedJobsStructured(t *testing.T) {
 				"test-job2",
 				"test-job4",
 				"test-job5",
+				"test-job6",
+				"test-job7",
+				"test-job8",
 			},
 		},
 	}
@@ -146,6 +205,76 @@ func TestGetUnusedJobsStructured(t *testing.T) {
 
 	if !reflect.DeepEqual(expectedOutput, actualOutput) {
 		t.Errorf("Expected output does not match actual output")
+	}
+}
+
+func TestFilterCronJobOwnedJobs(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
+		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
+	}, v1.CreateOptions{})
+
+	if err != nil {
+		t.Fatalf("Error creating namespace %s: %v", testNamespace, err)
+	}
+
+	// Create two jobs - one owned by cronjob, one standalone
+	// Job owned by cronjob (completed)
+	ownedJob := CreateTestJob(testNamespace, "cronjob-owned-job", &batchv1.JobStatus{
+		Succeeded:      1,
+		Failed:         0,
+		CompletionTime: &v1.Time{Time: time.Now()},
+	}, AppLabels)
+	// Add owner reference to cronjob
+	ownedJob.OwnerReferences = []v1.OwnerReference{
+		{
+			Kind: "CronJob",
+			Name: "test-cronjob",
+		},
+	}
+
+	// Standalone Job (completed)
+	standaloneJob := CreateTestJob(testNamespace, "standalone-job", &batchv1.JobStatus{
+		Succeeded:      1,
+		Failed:         0,
+		CompletionTime: &v1.Time{Time: time.Now()},
+	}, AppLabels)
+
+	_, err = clientset.BatchV1().Jobs(testNamespace).Create(context.TODO(), ownedJob, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake job: %v", err)
+	}
+
+	_, err = clientset.BatchV1().Jobs(testNamespace).Create(context.TODO(), standaloneJob, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake job: %v", err)
+	}
+
+	// Test without filter - should return both (both are completed)
+	filterOptsNoSkip := &filters.Options{IgnoreOwnerReferences: false}
+	unusedWithoutFilter, err := processNamespaceJobs(clientset, testNamespace, filterOptsNoSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused jobs: %v", err)
+	}
+
+	if len(unusedWithoutFilter) != 2 {
+		t.Errorf("Expected 2 unused Job objects without filter, got %d", len(unusedWithoutFilter))
+	}
+
+	// Test with filter - should return only standalone
+	filterOptsWithSkip := &filters.Options{IgnoreOwnerReferences: true}
+	unusedWithFilter, err := processNamespaceJobs(clientset, testNamespace, filterOptsWithSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused jobs: %v", err)
+	}
+
+	if len(unusedWithFilter) != 1 {
+		t.Errorf("Expected 1 unused Job object with filter, got %d", len(unusedWithFilter))
+	}
+
+	if unusedWithFilter[0].Name != "standalone-job" {
+		t.Errorf("Expected standalone-job to be unused, got %s", unusedWithFilter[0].Name)
 	}
 }
 

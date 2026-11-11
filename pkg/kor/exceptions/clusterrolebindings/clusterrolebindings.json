@@ -1,0 +1,76 @@
+{
+  "exceptionClusterRoleBindings": [
+    {
+      "Namespace": "",
+      "ResourceName": "kubeadm:kubelet-bootstrap"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "kubeadm:node-autoapprove-bootstrap"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "kubeadm:node-autoapprove-certificate-rotation"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "system:controller:route-controller"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "system:kube-dns"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "system:node"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "event-exporter-rb"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "kubelet-bootstrap"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "kubelet-bootstrap-node-bootstrapper"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "kubelet-cluster-admin"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "kubelet-nodepool-bootstrapper"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "kubelet-user-npd-binding"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "metrics-server-nanny:system:auth-delegator"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "metrics-server:system:auth-delegator"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "npd-binding"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "system:controller:horizontal-pod-autoscaler"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "system:controller:selinux-warning-controller"
+    },
+    {
+      "Namespace": "",
+      "ResourceName": "system:konnectivity-server"
+    }
+  ]
+}

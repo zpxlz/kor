@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
@@ -86,17 +87,6 @@ func retrieveUsedSA(clientset kubernetes.Interface, namespace string) ([]string,
 		}
 	}
 
-	config, err := unmarshalConfig(serviceAccountsConfig)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-
-	for _, resource := range config.ExceptionServiceAccounts {
-		if resource.Namespace == namespace || resource.Namespace == "*" {
-			podServiceAccounts = append(podServiceAccounts, resource.ResourceName)
-		}
-	}
-
 	roleServiceAccounts, err := getServiceAccountsFromRoleBindings(clientset, namespace)
 	if err != nil {
 		return nil, nil, nil, err
@@ -121,6 +111,11 @@ func retrieveServiceAccountNames(clientset kubernetes.Interface, namespace strin
 			continue
 		}
 
+		// Skip resources with ownerReferences if the general flag is set
+		if filterOpts.IgnoreOwnerReferences && len(serviceaccount.OwnerReferences) > 0 {
+			continue
+		}
+
 		if serviceaccount.Labels["kor/used"] == "false" {
 			unusedServiceAccountNames = append(unusedServiceAccountNames, serviceaccount.Name)
 			continue
@@ -131,8 +126,12 @@ func retrieveServiceAccountNames(clientset kubernetes.Interface, namespace strin
 	return names, unusedServiceAccountNames, nil
 }
 
-func processNamespaceSA(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]string, error) {
+func processNamespaceSA(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ([]ResourceInfo, error) {
 	usedServiceAccounts, roleServiceAccounts, clusterRoleServiceAccounts, err := retrieveUsedSA(clientset, namespace)
+	if err != nil {
+		return nil, err
+	}
+	config, err := unmarshalConfig(serviceAccountsConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -148,31 +147,47 @@ func processNamespaceSA(clientset kubernetes.Interface, namespace string, filter
 		return nil, err
 	}
 
-	diff := CalculateResourceDifference(usedServiceAccounts, serviceAccountNames)
-	diff = append(diff, unusedServiceAccountNames...)
-	return diff, nil
+	var unusedServiceAccounts []ResourceInfo
 
+	for _, name := range CalculateResourceDifference(usedServiceAccounts, serviceAccountNames) {
+		exceptionFound, err := isResourceException(name, namespace, config.ExceptionServiceAccounts)
+		if err != nil {
+			return nil, err
+		}
+
+		if exceptionFound {
+			continue
+		}
+		reason := "ServiceAccount is not in use"
+		unusedServiceAccounts = append(unusedServiceAccounts, ResourceInfo{Name: name, Reason: reason})
+	}
+
+	for _, name := range unusedServiceAccountNames {
+		reason := "Marked with unused label"
+		unusedServiceAccounts = append(unusedServiceAccounts, ResourceInfo{Name: name, Reason: reason})
+	}
+	if opts.DeleteFlag {
+		if unusedServiceAccounts, err = DeleteResource(unusedServiceAccounts, clientset, namespace, "ServiceAccount", opts.NoInteractive); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to delete Serviceaccount %s in namespace %s: %v\n", unusedServiceAccounts, namespace, err)
+		}
+	}
+	return unusedServiceAccounts, nil
 }
 
-func GetUnusedServiceAccounts(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+func GetUnusedServiceAccounts(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
 	for _, namespace := range filterOpts.Namespaces(clientset) {
-		diff, err := processNamespaceSA(clientset, namespace, filterOpts)
+		diff, err := processNamespaceSA(clientset, namespace, filterOpts, opts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to process namespace %s: %v\n", namespace, err)
 			continue
 		}
 		switch opts.GroupBy {
 		case "namespace":
-			resources[namespace] = make(map[string][]string)
+			resources[namespace] = make(map[string][]ResourceInfo)
 			resources[namespace]["ServiceAccount"] = diff
 		case "resource":
 			appendResources(resources, "ServiceAccount", namespace, diff)
-		}
-		if opts.DeleteFlag {
-			if diff, err = DeleteResource(diff, clientset, namespace, "ServiceAccount", opts.NoInteractive); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to delete Serviceaccount %s in namespace %s: %v\n", diff, namespace, err)
-			}
 		}
 	}
 

@@ -1,4 +1,5 @@
 .vscode
+.gomodcache
 *.iml
 .idea/
 dist/**
@@ -7,3 +8,6 @@ coverage.txt
 build/
 kor
 !kor/
+*.swp
+main
+hack/exceptions

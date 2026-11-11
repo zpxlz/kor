@@ -12,11 +12,12 @@ import (
 	fake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 func createTestPods(t *testing.T) *fake.Clientset {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
 		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
@@ -91,13 +92,14 @@ func createTestPods(t *testing.T) *fake.Clientset {
 
 func TestProcessNamespacePods(t *testing.T) {
 	clientset := createTestPods(t)
-	evictedPods, err := processNamespacePods(clientset, testNamespace, &filters.Options{})
+	evictedPods, err := processNamespacePods(clientset, testNamespace, &filters.Options{}, common.Opts{})
 	if err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
 	expectedEvictedPods := []string{
 		"pod-2",
+		"pod-3",
 		"pod-6",
 	}
 
@@ -106,7 +108,7 @@ func TestProcessNamespacePods(t *testing.T) {
 	}
 
 	for i, pod := range evictedPods {
-		if pod != expectedEvictedPods[i] {
+		if pod.Name != expectedEvictedPods[i] {
 			t.Errorf("Expected evicted pod %s, got %s", expectedEvictedPods[i], pod)
 		}
 	}
@@ -115,7 +117,7 @@ func TestProcessNamespacePods(t *testing.T) {
 func TestGetUnusedPodsStructured(t *testing.T) {
 	clientset := createTestPods(t)
 
-	opts := Opts{
+	opts := common.Opts{
 		WebhookURL:    "",
 		Channel:       "",
 		Token:         "",
@@ -133,6 +135,7 @@ func TestGetUnusedPodsStructured(t *testing.T) {
 		testNamespace: {
 			"Pod": {
 				"pod-2",
+				"pod-3",
 				"pod-6",
 			},
 		},
@@ -147,6 +150,78 @@ func TestGetUnusedPodsStructured(t *testing.T) {
 		t.Errorf("Expected output does not match actual output")
 		t.Errorf("Expected: %v", expectedOutput)
 		t.Errorf("Actual: %v", actualOutput)
+	}
+}
+
+func TestFilterOwnerReferencedPods(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
+		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
+	}, v1.CreateOptions{})
+
+	if err != nil {
+		t.Fatalf("Error creating namespace %s: %v", testNamespace, err)
+	}
+
+	// Create two pods - one owned by deployment, one standalone
+	// Pod owned by deployment (failed)
+	ownedPod := CreateTestPod(testNamespace, "owned-pod", "", nil, AppLabels)
+	ownedPod.Status = corev1.PodStatus{
+		Phase:   corev1.PodFailed,
+		Reason:  "Evicted",
+		Message: "",
+	}
+	// Add owner reference to deployment
+	ownedPod.OwnerReferences = []v1.OwnerReference{
+		{
+			Kind: "ReplicaSet",
+			Name: "test-replicaset",
+		},
+	}
+
+	// Standalone Pod (failed)
+	standalonePod := CreateTestPod(testNamespace, "standalone-pod", "", nil, AppLabels)
+	standalonePod.Status = corev1.PodStatus{
+		Phase:   corev1.PodFailed,
+		Reason:  "Evicted",
+		Message: "",
+	}
+
+	_, err = clientset.CoreV1().Pods(testNamespace).Create(context.TODO(), ownedPod, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake pod: %v", err)
+	}
+
+	_, err = clientset.CoreV1().Pods(testNamespace).Create(context.TODO(), standalonePod, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake pod: %v", err)
+	}
+
+	// Test without filter - should return both
+	filterOptsNoSkip := &filters.Options{IgnoreOwnerReferences: false}
+	unusedWithoutFilter, err := processNamespacePods(clientset, testNamespace, filterOptsNoSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused pods: %v", err)
+	}
+
+	if len(unusedWithoutFilter) != 2 {
+		t.Errorf("Expected 2 unused Pod objects without filter, got %d", len(unusedWithoutFilter))
+	}
+
+	// Test with filter - should return only standalone
+	filterOptsWithSkip := &filters.Options{IgnoreOwnerReferences: true}
+	unusedWithFilter, err := processNamespacePods(clientset, testNamespace, filterOptsWithSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused pods: %v", err)
+	}
+
+	if len(unusedWithFilter) != 1 {
+		t.Errorf("Expected 1 unused Pod object with filter, got %d", len(unusedWithFilter))
+	}
+
+	if unusedWithFilter[0].Name != "standalone-pod" {
+		t.Errorf("Expected standalone-pod to be unused, got %s", unusedWithFilter[0].Name)
 	}
 }
 

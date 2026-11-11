@@ -13,11 +13,12 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
 func createTestSecrets(t *testing.T) *fake.Clientset {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
 		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
@@ -32,6 +33,7 @@ func createTestSecrets(t *testing.T) *fake.Clientset {
 	secret3 := CreateTestSecret(testNamespace, "test-secret3", AppLabels)
 	secret4 := CreateTestSecret(testNamespace, "test-secret4", UsedLabels)
 	secret5 := CreateTestSecret(testNamespace, "test-secret5", UnusedLabels)
+	secret6 := CreateTestSecret(testNamespace, "test-secret6", AppLabels)
 
 	pod1 := CreateTestPod(testNamespace, "pod-1", "", []corev1.Volume{
 		{
@@ -53,7 +55,7 @@ func createTestSecrets(t *testing.T) *fake.Clientset {
 			Env: []corev1.EnvVar{
 				{
 					Name:      "ENV_VAR_1",
-					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secret1.ObjectMeta.Name}}},
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secret1.Name}}},
 				},
 			},
 		},
@@ -63,7 +65,7 @@ func createTestSecrets(t *testing.T) *fake.Clientset {
 	pod4.Spec.Containers = []corev1.Container{
 		{
 			EnvFrom: []corev1.EnvFromSource{
-				{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: secret1.ObjectMeta.Name}}},
+				{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: secret1.Name}}},
 			},
 		},
 	}
@@ -74,7 +76,7 @@ func createTestSecrets(t *testing.T) *fake.Clientset {
 			Env: []corev1.EnvVar{
 				{
 					Name:      "INIT_ENV_VAR_1",
-					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secret1.ObjectMeta.Name}}},
+					ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: secret1.Name}}},
 				},
 			},
 		},
@@ -82,8 +84,17 @@ func createTestSecrets(t *testing.T) *fake.Clientset {
 
 	pod6 := CreateTestPod(testNamespace, "pod-6", "", nil, AppLabels)
 	pod6.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
-		{Name: secret1.ObjectMeta.Name},
-		{Name: secret2.ObjectMeta.Name},
+		{Name: secret1.Name},
+		{Name: secret2.Name},
+	}
+
+	pod7 := CreateTestPod(testNamespace, "pod-7", "", nil, AppLabels)
+	pod7.Spec.InitContainers = []corev1.Container{
+		{
+			EnvFrom: []corev1.EnvFromSource{
+				{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: secret6.Name}}},
+			},
+		},
 	}
 
 	_, err = clientset.CoreV1().Pods(testNamespace).Create(context.TODO(), pod1, v1.CreateOptions{})
@@ -116,6 +127,11 @@ func createTestSecrets(t *testing.T) *fake.Clientset {
 		t.Fatalf("Error creating fake pod: %v", err)
 	}
 
+	_, err = clientset.CoreV1().Pods(testNamespace).Create(context.TODO(), pod7, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake pod: %v", err)
+	}
+
 	_, err = clientset.CoreV1().Secrets(testNamespace).Create(context.TODO(), secret1, v1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Error creating fake %s: %v", "Secret", err)
@@ -141,11 +157,16 @@ func createTestSecrets(t *testing.T) *fake.Clientset {
 		t.Fatalf("Error creating fake %s: %v", "Secret", err)
 	}
 
+	_, err = clientset.CoreV1().Secrets(testNamespace).Create(context.TODO(), secret6, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake %s: %v", "Secret", err)
+	}
+
 	return clientset
 }
 
 func TestRetrieveIngressTLS(t *testing.T) {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	ingress1 := CreateTestIngress(testNamespace, "test-ingress-1", "my-service-1", "test-secret1", AppLabels)
 	appLabels := map[string]string{}
@@ -208,7 +229,7 @@ func TestRetrieveUsedSecret(t *testing.T) {
 		t.Errorf("Expected envFrom secrets %v, got %v", expectedEnvSecrets2, envSecrets2)
 	}
 
-	expectedInitContainerEnvSecrets := []string{"test-secret1"}
+	expectedInitContainerEnvSecrets := []string{"test-secret1", "test-secret6"}
 	if !equalSlices(initContainerEnvSecrets, expectedInitContainerEnvSecrets) {
 		t.Errorf("Expected initContainer env secrets %v, got %v", expectedInitContainerEnvSecrets, initContainerEnvSecrets)
 	}
@@ -224,7 +245,7 @@ func TestRetrieveUsedSecret(t *testing.T) {
 }
 
 func TestRetrieveSecretNames(t *testing.T) {
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 
 	appLabels := map[string]string{}
 	secret1 := CreateTestSecret(testNamespace, "secret-1", appLabels)
@@ -258,25 +279,63 @@ func TestRetrieveSecretNames(t *testing.T) {
 func TestProcessNamespaceSecret(t *testing.T) {
 	clientset := createTestSecrets(t)
 
-	unusedSecrets, err := processNamespaceSecret(clientset, testNamespace, &filters.Options{})
+	unusedSecrets, err := processNamespaceSecret(clientset, testNamespace, &filters.Options{}, common.Opts{})
 	if err != nil {
 		t.Fatalf("Error retrieving unused secrets: %v", err)
 	}
 
 	if len(unusedSecrets) != 2 {
-		t.Errorf("Expected 2 used Secret objects, got %d", len(unusedSecrets))
+		t.Errorf("Expected 2 unused Secret objects, got %d", len(unusedSecrets))
 	}
 
-	if !contains(unusedSecrets, "test-secret3") {
-		t.Error("Expected specific Secret  in the list")
+	if !resourceInfoContains(unusedSecrets, "test-secret3") {
+		t.Error("Expected specific Secret in the list")
 	}
 
+}
+
+func TestProcessNamespaceSecretCSINodePublishSecretRef(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	usedSecret := CreateTestSecret(testNamespace, "csi-credentials", AppLabels)
+	unusedSecret := CreateTestSecret(testNamespace, "orphan", AppLabels)
+
+	pod := CreateTestPod(testNamespace, "csi-pod", "", []corev1.Volume{
+		{
+			Name: "secrets-store",
+			VolumeSource: corev1.VolumeSource{CSI: &corev1.CSIVolumeSource{
+				Driver:               "secrets-store.csi.k8s.io",
+				NodePublishSecretRef: &corev1.LocalObjectReference{Name: usedSecret.Name},
+			}},
+		},
+	}, AppLabels)
+
+	if _, err := clientset.CoreV1().Pods(testNamespace).Create(context.TODO(), pod, v1.CreateOptions{}); err != nil {
+		t.Fatalf("Error creating fake pod: %v", err)
+	}
+	for _, secret := range []*corev1.Secret{usedSecret, unusedSecret} {
+		if _, err := clientset.CoreV1().Secrets(testNamespace).Create(context.TODO(), secret, v1.CreateOptions{}); err != nil {
+			t.Fatalf("Error creating fake secret: %v", err)
+		}
+	}
+
+	unusedSecrets, err := processNamespaceSecret(clientset, testNamespace, &filters.Options{}, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused secrets: %v", err)
+	}
+
+	if resourceInfoContains(unusedSecrets, usedSecret.Name) {
+		t.Errorf("Secret %s is referenced by a CSI volume nodePublishSecretRef and must not be reported as unused", usedSecret.Name)
+	}
+	if !resourceInfoContains(unusedSecrets, unusedSecret.Name) {
+		t.Errorf("Expected %s to be reported as unused", unusedSecret.Name)
+	}
 }
 
 func TestGetUnusedSecretsStructured(t *testing.T) {
 	clientset := createTestSecrets(t)
 
-	opts := Opts{
+	opts := common.Opts{
 		WebhookURL:    "",
 		Channel:       "",
 		Token:         "",
@@ -309,12 +368,86 @@ func TestGetUnusedSecretsStructured(t *testing.T) {
 	}
 }
 
+func TestFilterOwnerReferencedSecrets(t *testing.T) {
+	clientset := fake.NewClientset()
+
+	_, err := clientset.CoreV1().Namespaces().Create(context.TODO(), &corev1.Namespace{
+		ObjectMeta: v1.ObjectMeta{Name: testNamespace},
+	}, v1.CreateOptions{})
+
+	if err != nil {
+		t.Fatalf("Error creating namespace %s: %v", testNamespace, err)
+	}
+
+	// Create two secrets - one owned by deployment, one standalone
+	// Secret owned by deployment
+	ownedSecret := CreateTestSecret(testNamespace, "owned-secret", AppLabels)
+	// Add owner reference to deployment
+	ownedSecret.OwnerReferences = []v1.OwnerReference{
+		{
+			Kind: "Deployment",
+			Name: "test-deployment",
+		},
+	}
+
+	// Standalone Secret
+	standaloneSecret := CreateTestSecret(testNamespace, "standalone-secret", AppLabels)
+
+	_, err = clientset.CoreV1().Secrets(testNamespace).Create(context.TODO(), ownedSecret, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake secret: %v", err)
+	}
+
+	_, err = clientset.CoreV1().Secrets(testNamespace).Create(context.TODO(), standaloneSecret, v1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Error creating fake secret: %v", err)
+	}
+
+	// Test without filter - should return both
+	filterOptsNoSkip := &filters.Options{IgnoreOwnerReferences: false}
+	unusedWithoutFilter, err := processNamespaceSecret(clientset, testNamespace, filterOptsNoSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused secrets: %v", err)
+	}
+
+	if len(unusedWithoutFilter) != 2 {
+		t.Errorf("Expected 2 unused Secret objects without filter, got %d", len(unusedWithoutFilter))
+	}
+
+	// Test with filter - should return only standalone
+	filterOptsWithSkip := &filters.Options{IgnoreOwnerReferences: true}
+	unusedWithFilter, err := processNamespaceSecret(clientset, testNamespace, filterOptsWithSkip, common.Opts{})
+	if err != nil {
+		t.Fatalf("Error retrieving unused secrets: %v", err)
+	}
+
+	if len(unusedWithFilter) != 1 {
+		t.Errorf("Expected 1 unused Secret object with filter, got %d", len(unusedWithFilter))
+	}
+
+	if unusedWithFilter[0].Name != "standalone-secret" {
+		t.Errorf("Expected standalone-secret to be unused, got %s", unusedWithFilter[0].Name)
+	}
+}
+
 func equalSlices(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
 	}
 	for i, v := range a {
 		if v != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalResourceInfoSlices(a, b []ResourceInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, v := range a {
+		if v.Name != b[i].Name || v.Reason != b[i].Reason {
 			return false
 		}
 	}

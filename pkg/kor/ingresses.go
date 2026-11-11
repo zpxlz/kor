@@ -12,6 +12,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 
+	"github.com/yonahd/kor/pkg/common"
 	"github.com/yonahd/kor/pkg/filters"
 )
 
@@ -36,7 +37,7 @@ func retrieveUsedIngress(clientset kubernetes.Interface, namespace string, filte
 	usedIngresses := []string{}
 
 	for _, ingress := range ingresses.Items {
-		if pass, _ := filter.Run(filterOpts); pass {
+		if pass, _ := filter.SetObject(&ingress).Run(filterOpts); pass {
 			continue
 		}
 
@@ -81,6 +82,11 @@ func retrieveIngressNames(clientset kubernetes.Interface, namespace string, filt
 			continue
 		}
 
+		// Skip if resource has owner references and ignore flag is set
+		if filterOpts.IgnoreOwnerReferences && len(ingress.OwnerReferences) > 0 {
+			continue
+		}
+
 		if ingress.Labels["kor/used"] == "false" {
 			unusedIngressNames = append(unusedIngressNames, ingress.Name)
 			continue
@@ -90,7 +96,7 @@ func retrieveIngressNames(clientset kubernetes.Interface, namespace string, filt
 	return names, unusedIngressNames, nil
 }
 
-func processNamespaceIngresses(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options) ([]string, error) {
+func processNamespaceIngresses(clientset kubernetes.Interface, namespace string, filterOpts *filters.Options, opts common.Opts) ([]ResourceInfo, error) {
 	usedIngresses, err := retrieveUsedIngress(clientset, namespace, filterOpts)
 	if err != nil {
 		return nil, err
@@ -100,31 +106,40 @@ func processNamespaceIngresses(clientset kubernetes.Interface, namespace string,
 		return nil, err
 	}
 
-	diff := CalculateResourceDifference(usedIngresses, ingressNames)
-	diff = append(diff, unusedIngressNames...)
+	var diff []ResourceInfo
+
+	for _, name := range CalculateResourceDifference(usedIngresses, ingressNames) {
+		reason := "Ingress does not have a valid backend service"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+
+	for _, name := range unusedIngressNames {
+		reason := "Marked with unused label"
+		diff = append(diff, ResourceInfo{Name: name, Reason: reason})
+	}
+	if opts.DeleteFlag {
+		if diff, err = DeleteResource(diff, clientset, namespace, "Ingress", opts.NoInteractive); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to delete Ingress %s in namespace %s: %v\n", diff, namespace, err)
+		}
+	}
 	return diff, nil
 
 }
 
-func GetUnusedIngresses(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts Opts) (string, error) {
-	resources := make(map[string]map[string][]string)
+func GetUnusedIngresses(filterOpts *filters.Options, clientset kubernetes.Interface, outputFormat string, opts common.Opts) (string, error) {
+	resources := make(map[string]map[string][]ResourceInfo)
 	for _, namespace := range filterOpts.Namespaces(clientset) {
-		diff, err := processNamespaceIngresses(clientset, namespace, filterOpts)
+		diff, err := processNamespaceIngresses(clientset, namespace, filterOpts, opts)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to process namespace %s: %v\n", namespace, err)
 			continue
 		}
 		switch opts.GroupBy {
 		case "namespace":
-			resources[namespace] = make(map[string][]string)
+			resources[namespace] = make(map[string][]ResourceInfo)
 			resources[namespace]["Ingress"] = diff
 		case "resource":
 			appendResources(resources, "Ingress", namespace, diff)
-		}
-		if opts.DeleteFlag {
-			if diff, err = DeleteResource(diff, clientset, namespace, "Ingress", opts.NoInteractive); err != nil {
-				fmt.Fprintf(os.Stderr, "Failed to delete Ingress %s in namespace %s: %v\n", diff, namespace, err)
-			}
 		}
 	}
 
